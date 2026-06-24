@@ -1,0 +1,15 @@
+.gradle/
+.kotlin/
+.idea/
+.tmp_ort_aar/
+local.properties
+
+app/build/
+app/.cxx/
+build/
+
+*.zip
+
+app/src/main/assets/models/
+app/src/main/assets/baseline/
+app/src/main/assets/gvcrt_clean_manifest.json
