@@ -13,3 +13,5 @@ build/
 app/src/main/assets/models/
 app/src/main/assets/baseline/
 app/src/main/assets/gvcrt_clean_manifest.json
+sdk/
+outputs/

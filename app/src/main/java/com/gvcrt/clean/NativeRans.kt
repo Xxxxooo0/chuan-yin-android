@@ -48,6 +48,21 @@ class NativeRans private constructor(private var handle: Long) : Closeable {
         return nativeDecode(handle, payload, zTotalSize, zStartOffset, zPerChannelSize, yIndexes)
     }
 
+    fun beginDecode(payload: ByteArray) {
+        check(handle != 0L) { "rANS session is closed" }
+        nativeBeginDecode(handle, payload)
+    }
+
+    fun decodeZ(zTotalSize: Int, zStartOffset: Int, zPerChannelSize: Int): ByteArray {
+        check(handle != 0L) { "rANS session is closed" }
+        return nativeDecodeZ(handle, zTotalSize, zStartOffset, zPerChannelSize)
+    }
+
+    fun decodeY(indexes: ByteArray): ByteArray {
+        check(handle != 0L) { "rANS session is closed" }
+        return nativeDecodeY(handle, indexes)
+    }
+
     override fun close() {
         if (handle != 0L) {
             nativeRelease(handle)
@@ -110,6 +125,20 @@ class NativeRans private constructor(private var handle: Long) : Closeable {
         ): Array<ByteArray>
 
         @JvmStatic
+        private external fun nativeBeginDecode(handle: Long, payload: ByteArray)
+
+        @JvmStatic
+        private external fun nativeDecodeZ(
+            handle: Long,
+            zTotalSize: Int,
+            zStartOffset: Int,
+            zPerChannelSize: Int,
+        ): ByteArray
+
+        @JvmStatic
+        private external fun nativeDecodeY(handle: Long, indexes: ByteArray): ByteArray
+
+        @JvmStatic
         private external fun nativeRelease(handle: Long)
     }
 }
@@ -130,14 +159,21 @@ object EntropySymbols {
         return ShortArray(symbols.data.size) { index ->
             val symbol = symbols.data[index].toExactInt("${symbols.name}[$index]")
             require(symbol in -128..127) { "${symbols.name}[$index] outside int8 range" }
-            val scale = scales.data[index].coerceIn(SCALE_MIN, SCALE_MAX)
-            val cdfIndex = ((ln(scale) - LOG_SCALE_MIN) * LOG_STEP_RECIP).toInt().coerceIn(0, 127)
+            val cdfIndex = cdfIndex(scales.data[index])
             ((symbol shl 8) + cdfIndex).toShort()
         }
     }
 
+    fun indexesForScales(scales: TensorValue): ByteArray =
+        ByteArray(scales.data.size) { index -> cdfIndex(scales.data[index]).toByte() }
+
     fun indexes(packed: ShortArray): ByteArray =
         ByteArray(packed.size) { index -> (packed[index].toInt() and 0xff).toByte() }
+
+    private fun cdfIndex(rawScale: Float): Int {
+        val scale = rawScale.coerceIn(SCALE_MIN, SCALE_MAX)
+        return ((ln(scale) - LOG_SCALE_MIN) * LOG_STEP_RECIP).toInt().coerceIn(0, 127)
+    }
 
     private fun Float.toExactInt(label: String): Int {
         val rounded = toInt()

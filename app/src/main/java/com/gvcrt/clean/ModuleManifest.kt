@@ -56,11 +56,28 @@ data class StreamSpec(
     val useAdaI: Int,
 )
 
+data class DecoderPathSpec(
+    val zShape: LongArray,
+    val yStageShape: LongArray,
+    val hyperPrior: GraphStep,
+    val stages: List<GraphStep>,
+    val recon: GraphStep,
+    val temporal: GraphStep? = null,
+)
+
+data class DecoderSpec(
+    val androidInput: String,
+    val fallbackInput: String,
+    val i: DecoderPathSpec,
+    val p: DecoderPathSpec,
+)
+
 data class CleanManifest(
     val metadata: JSONObject,
     val modules: Map<String, List<ModuleCase>>,
     val entropy: Map<String, EntropySpec>,
     val stream: StreamSpec?,
+    val decoder: DecoderSpec?,
 ) {
     companion object {
         fun parse(text: String): CleanManifest {
@@ -83,6 +100,7 @@ data class CleanManifest(
                 modules,
                 entropy,
                 root.optJSONObject("stream")?.let(::parseStream),
+                root.optJSONObject("decoder")?.let(::parseDecoder),
             )
         }
 
@@ -107,6 +125,26 @@ data class CleanManifest(
                 payload = json.getString("payload"),
                 twoEntropyCoders = json.getBoolean("two_entropy_coders"),
             )
+
+        private fun parseDecoder(json: JSONObject): DecoderSpec =
+            DecoderSpec(
+                androidInput = json.getString("android_input"),
+                fallbackInput = json.getString("fallback_input"),
+                i = parseDecoderPath(json.getJSONObject("i"), false),
+                p = parseDecoderPath(json.getJSONObject("p"), true),
+            )
+
+        private fun parseDecoderPath(json: JSONObject, hasTemporal: Boolean): DecoderPathSpec {
+            val stages = json.getJSONArray("stages")
+            return DecoderPathSpec(
+                zShape = json.getJSONArray("z_shape").toLongArray(),
+                yStageShape = json.getJSONArray("y_stage_shape").toLongArray(),
+                hyperPrior = parseStep(json.getJSONObject("hyper_prior")),
+                stages = List(stages.length()) { parseStep(stages.getJSONObject(it)) },
+                recon = parseStep(json.getJSONObject("recon")),
+                temporal = if (hasTemporal) parseStep(json.getJSONObject("temporal")) else null,
+            )
+        }
 
         private fun parseCdf(json: JSONObject): CdfSpec =
             CdfSpec(

@@ -19,6 +19,10 @@ class CleanModuleTests(
     fun runModule(moduleName: String) {
         emit("module=$moduleName")
         emitMetadata()
+        if (moduleName == "complete_decoder") {
+            runCompleteDecoder()
+            return
+        }
         val cases = manifest.modules[moduleName]
             ?: error("module '$moduleName' is not present in $MANIFEST")
         OnnxSessionRunner(store).use { runner ->
@@ -31,18 +35,7 @@ class CleanModuleTests(
         val tensors = linkedMapOf<String, TensorValue>()
         case.steps.forEach { step ->
             emit("step=${step.name} model=${step.model} sha256=${store.sha256(step.model)}")
-            val inputs = step.inputs.associate { spec ->
-                val tensor = when {
-                    spec.source != null -> tensors.getValue(spec.source)
-                    spec.path != null && spec.shape != null -> TensorIO.readF32Le(
-                        spec.tensorName,
-                        spec.shape,
-                        store.readBytes(spec.path),
-                    )
-                    else -> error("input ${spec.tensorName} needs source or path+shape")
-                }
-                spec.tensorName to tensor
-            }
+            val inputs = resolveInputs(step, tensors)
             val outputs = runner.run(step, inputs)
             outputs.forEach { (name, tensor) ->
                 tensors[name] = tensor
@@ -75,6 +68,178 @@ class CleanModuleTests(
             }
         }
     }
+
+    private fun runCompleteDecoder() {
+        val decoder = manifest.decoder ?: error("missing decoder specification in $MANIFEST")
+        val streamBaseline = manifest.stream ?: error("missing stream specification in $MANIFEST")
+        val usesAndroidOutput = store.outputExists(decoder.androidInput)
+        val streamBytes = if (usesAndroidOutput) {
+            store.readOutput(decoder.androidInput)
+        } else {
+            store.readBytes(decoder.fallbackInput)
+        }
+        emit(
+            "case=full_bitstream_decode_v2 input=${if (usesAndroidOutput) decoder.androidInput else decoder.fallbackInput} " +
+                "bytes=${streamBytes.size} sha256=${AssetStore.sha256(streamBytes)}"
+        )
+
+        val parsed = GvcStreamMuxer.demux(streamBytes)
+        require(parsed.stream.height == streamBaseline.height && parsed.stream.width == streamBaseline.width) {
+            "decoder stream geometry ${parsed.stream.height}x${parsed.stream.width} does not match " +
+                "manifest ${streamBaseline.height}x${streamBaseline.width}"
+        }
+        require(parsed.stream.qp == streamBaseline.qp) {
+            "decoder stream QP ${parsed.stream.qp} does not match manifest ${streamBaseline.qp}"
+        }
+        require(parsed.stream.ecPart == streamBaseline.ecPart && parsed.stream.useAdaI == streamBaseline.useAdaI) {
+            "decoder stream entropy flags do not match manifest"
+        }
+        val remuxed = GvcStreamMuxer.mux(parsed.stream, parsed.iPayload, parsed.pPayload)
+        emitBinaryComparison("decoder_stream_remux", remuxed, streamBytes)
+
+        val iEntropy = manifest.entropy["i"] ?: error("missing I rANS assets")
+        val pEntropy = manifest.entropy["p"] ?: error("missing P rANS assets")
+        emitBinaryComparison("decoder_i_payload", parsed.iPayload, store.readBytes(iEntropy.payload))
+        emitBinaryComparison("decoder_p_payload", parsed.pPayload, store.readBytes(pEntropy.payload))
+
+        val tensors = linkedMapOf<String, TensorValue>()
+        OnnxSessionRunner(store).use { runner ->
+            decodeEntropyPath("i", parsed.iPayload, iEntropy, decoder.i, runner, tensors)
+            val iRecon = runDecoderStep(runner, decoder.i.recon, tensors)
+            tensors.putAll(iRecon)
+            writeTensorOutput("outputs/decoded_i_y_hat.f32le", tensors.getValue("i_y_hat"))
+            writeTensorOutput("outputs/decoder_i_reference_frame.f32le", tensors.getValue("encoder_i_reference_frame"))
+
+            val temporal = decoder.p.temporal ?: error("missing P decoder temporal step")
+            val temporalOutputs = runDecoderStep(runner, temporal, tensors)
+            tensors.putAll(temporalOutputs)
+
+            decodeEntropyPath("p", parsed.pPayload, pEntropy, decoder.p, runner, tensors)
+            val pRecon = runDecoderStep(runner, decoder.p.recon, tensors)
+            tensors.putAll(pRecon)
+            writeTensorOutput("outputs/decoded_p_y_hat.f32le", tensors.getValue("p_y_hat"))
+            writeTensorOutput("outputs/decoder_p_reference_feature.f32le", tensors.getValue("encoder_p_reference_feature"))
+            writeTensorOutput("outputs/decoder_p_reference_frame.f32le", tensors.getValue("encoder_p_reference_frame"))
+        }
+        emit("complete_decoder_status=PASS")
+    }
+
+    private fun decodeEntropyPath(
+        prefix: String,
+        payload: ByteArray,
+        entropy: EntropySpec,
+        decoder: DecoderPathSpec,
+        runner: OnnxSessionRunner,
+        tensors: MutableMap<String, TensorValue>,
+    ) {
+        require(!entropy.twoEntropyCoders) { "two-entropy-coder mode is not enabled in clean Android" }
+        val gaussian = CdfTable.load(store, entropy.gaussian)
+        val zTable = CdfTable.load(store, entropy.z)
+        NativeRans.create(gaussian, zTable).use { rans ->
+            rans.beginDecode(payload)
+            val zName = "${prefix}_z_hat"
+            val z = TensorIO.fromI8(
+                zName,
+                decoder.zShape,
+                rans.decodeZ(decoder.zShape.elementCount(), entropy.zStartOffset, entropy.zPerChannelSize),
+            )
+            tensors[zName] = z
+            emitAndRequireDiscreteComparison(zName, z, baselineTensor(zName, decoder.zShape))
+
+            tensors.putAll(runDecoderStep(runner, decoder.hyperPrior, tensors))
+            decoder.stages.forEachIndexed { stageIndex, stage ->
+                val yInput = stage.inputs.single { it.tensorName.contains("_y_q_w_") }.tensorName
+                val scaleOutput = stage.outputs.single { it.tensorName.contains("_s_w_") }
+                val stateOutput = stage.outputs.single { it.tensorName != scaleOutput.tensorName }
+
+                tensors[yInput] = TensorValue(yInput, decoder.yStageShape, FloatArray(decoder.yStageShape.elementCount()))
+                val scaleProbe = runDecoderStep(
+                    runner,
+                    stage,
+                    tensors,
+                    setOf(scaleOutput.tensorName),
+                )
+                val scales = scaleProbe.getValue(scaleOutput.tensorName)
+                val decodedSymbols = rans.decodeY(EntropySymbols.indexesForScales(scales))
+                val y = TensorIO.fromI8(yInput, decoder.yStageShape, decodedSymbols)
+                tensors[yInput] = y
+                emitAndRequireDiscreteComparison(yInput, y, baselineTensor(yInput, decoder.yStageShape))
+
+                val stageOutputs = runDecoderStep(
+                    runner,
+                    stage,
+                    tensors,
+                    setOf(stateOutput.tensorName),
+                )
+                tensors.putAll(stageOutputs)
+                emit("decoder_${prefix}_stage=$stageIndex symbols=${decodedSymbols.size}")
+            }
+        }
+    }
+
+    private fun runDecoderStep(
+        runner: OnnxSessionRunner,
+        step: GraphStep,
+        tensors: Map<String, TensorValue>,
+        compareOutputs: Set<String>? = null,
+    ): Map<String, TensorValue> {
+        emit("step=${step.name} model=${step.model} sha256=${store.sha256(step.model)}")
+        val outputs = runner.run(step, resolveInputs(step, tensors))
+        outputs.forEach { (name, tensor) ->
+            emit("output=$name shape=${TensorIO.shapeText(tensor.shape)} elements=${tensor.numel}")
+        }
+        step.outputs.forEach { output ->
+            val baselinePath = output.baseline ?: return@forEach
+            if (compareOutputs == null || output.tensorName in compareOutputs) {
+                emitTensorComparison(output.tensorName, outputs.getValue(output.tensorName), baselineTensor(output.tensorName, output.shape, baselinePath))
+            }
+        }
+        return outputs
+    }
+
+    private fun resolveInputs(step: GraphStep, tensors: Map<String, TensorValue>): Map<String, TensorValue> =
+        step.inputs.associate { spec ->
+            val tensor = when {
+                spec.source != null -> tensors.getValue(spec.source)
+                spec.path != null && spec.shape != null -> TensorIO.readF32Le(
+                    spec.tensorName,
+                    spec.shape,
+                    store.readBytes(spec.path),
+                )
+                else -> error("input ${spec.tensorName} needs source or path+shape")
+            }
+            spec.tensorName to tensor
+        }
+
+    private fun baselineTensor(name: String, shape: LongArray, path: String = "baseline/tensors/$name.f32le"): TensorValue =
+        TensorIO.readF32Le(name, shape, store.readBytes(path))
+
+    private fun writeTensorOutput(path: String, tensor: TensorValue) {
+        store.writeOutput(path, TensorIO.f32Le(tensor))
+        emit("wrote=$path elements=${tensor.numel}")
+    }
+
+    private fun emitAndRequireDiscreteComparison(name: String, actual: TensorValue, expected: TensorValue) {
+        val diff = TensorIO.diff(actual, expected)
+        emit("compare=$name kind=discrete pass=${diff.exact} exact=${diff.exact} first_diff=${firstDifference(actual, expected)}")
+        require(diff.exact) { "$name differs from the server baseline" }
+    }
+
+    private fun emitTensorComparison(name: String, actual: TensorValue, expected: TensorValue) {
+        val diff = TensorIO.diff(actual, expected)
+        val discrete = isDiscrete(name)
+        val passed = if (discrete) diff.exact else diff.maxAbs <= CONTINUOUS_MAX_ABS_TOLERANCE
+        emit(
+            "compare=$name kind=${if (discrete) "discrete" else "continuous"} " +
+                "pass=$passed exact=${diff.exact} max_abs=${"%.8f".format(diff.maxAbs)} " +
+                "mean_abs=${"%.8f".format(diff.meanAbs)} rmse=${"%.8f".format(diff.rmse)}"
+        )
+    }
+
+    private fun firstDifference(actual: TensorValue, expected: TensorValue): Int =
+        actual.data.indices.firstOrNull { actual.data[it] != expected.data[it] } ?: -1
+
+    private fun LongArray.elementCount(): Int = fold(1L) { acc, value -> acc * value }.toInt()
 
     private fun runEntropyEncoder(tensors: Map<String, TensorValue>) {
         runEntropyPath("i", manifest.entropy["i"] ?: error("missing I rANS assets"), tensors, 4)
@@ -137,12 +302,15 @@ class CleanModuleTests(
     private fun emitBinaryComparison(androidPath: String, baselinePath: String) {
         val actual = store.readOutput(androidPath)
         val expected = store.readBytes(baselinePath)
+        emitBinaryComparison("android=$androidPath baseline=$baselinePath", actual, expected)
+    }
+
+    private fun emitBinaryComparison(name: String, actual: ByteArray, expected: ByteArray) {
         val firstDiff = actual.indices.firstOrNull { index ->
             index >= expected.size || actual[index] != expected[index]
         } ?: if (actual.size == expected.size) null else minOf(actual.size, expected.size)
         emit(
-            "binary_compare android=$androidPath baseline=$baselinePath " +
-                "exact=${firstDiff == null} android_bytes=${actual.size} server_bytes=${expected.size} " +
+            "binary_compare $name exact=${firstDiff == null} actual_bytes=${actual.size} expected_bytes=${expected.size} " +
                 "first_diff=${firstDiff ?: -1}"
         )
     }

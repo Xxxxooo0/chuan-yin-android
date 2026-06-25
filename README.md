@@ -6,12 +6,10 @@ GVC-RT modules:
 1. Temporal reference: previous reference frame/feature to `ctx` and `ctx_t`.
 2. Complete encoding: I encode, local I reconstruction, P temporal reference,
    P encode, and P reference update.
-3. Complete decoding: v1 covers the post-entropy neural decode path from
-   server `y_hat` tensors to reconstructed reference outputs.
+3. Complete decoding: parses I/P NAL payloads, decodes `z` and each spatial
+   prior stage through native rANS, then reconstructs and updates references.
 
-The source of truth is `D:\sever_chuanyin\GVC-RT_inference`. Previous Android
-ONNX files, exporters, benchmark code, and diagnostic probes are intentionally
-not reused.
+This Android project is self-contained for build and on-device runs: Gradle wrapper, Android SDK, ONNX assets, entropy tables, baselines, and sample images live under this project directory. The PyTorch source tree is only required when re-exporting assets; pass it with `--source-root` or `GVC_RT_SOURCE_ROOT`. Previous Android ONNX files, exporters, benchmark code, and diagnostic probes are intentionally not reused.
 
 ## Export On Server
 
@@ -35,7 +33,7 @@ cd D:\android\ceshi\GVC-RT_clean_android
 ## Run On Android
 
 ```powershell
-$adb = 'D:\android\ceshi\GVC-RT_inference\Android\sdk\platform-tools\adb.exe'
+$adb = 'D:\android\ceshi\GVC-RT_clean_android\sdk\platform-tools\adb.exe'
 & $adb install -r .\app\build\outputs\apk\debug\app-debug.apk
 & $adb logcat -c
 & $adb shell am force-stop com.gvcrt.clean
@@ -44,12 +42,44 @@ $adb = 'D:\android\ceshi\GVC-RT_inference\Android\sdk\platform-tools\adb.exe'
 ```
 
 Use `--ez completeEncoderTest true` or `--ez completeDecoderTest true` for the
-other two module entries.
+other two module entries. Run the encoder first when validating Android's own
+bitstream: the decoder then reads `outputs/encoded_ip.gvc`; without it, the
+decoder explicitly falls back to the packaged server stream baseline.
+
+Use `--ez fullProjectTest true` to run the clean project entry. It executes the
+three modules in order: temporal reference, complete encoder, then complete
+decoder. The decoder consumes the Android-generated `outputs/encoded_ip.gvc`
+written by the encoder in the same run.
+
+Use `--ez imageInferenceTest true` for one-image inference. Without an explicit
+image path it uses `assets/sample/sample_input.png`; with `--es imagePath ...`
+it decodes that PNG/JPEG path on the device, resizes to `256x512`, normalizes to
+`[-1,1]`, runs encode/decode, and prints a short quality and timing summary.
+
+```powershell
+& $adb shell am start -n com.gvcrt.clean/.MainActivity --ez imageInferenceTest true
+& $adb push .\your_image.png /sdcard/Download/gvcrt_input.png
+& $adb shell am start -n com.gvcrt.clean/.MainActivity --ez imageInferenceTest true --es imagePath /sdcard/Download/gvcrt_input.png
+```
+
+## Speed Tests
+
+The second button row runs device-only speed benchmarks. Each benchmark keeps
+the ONNX sessions and CDF tables warm, performs 5 warmup runs, and reports 50
+measured samples as mean, p50, p90, and fps. Session initialization, baseline
+comparison, and output-file writes are excluded from measured samples.
+
+```powershell
+& $adb shell am start -n com.gvcrt.clean/.MainActivity --ez temporalReferenceSpeedTest true
+& $adb shell am start -n com.gvcrt.clean/.MainActivity --ez completeEncoderSpeedTest true
+& $adb shell am start -n com.gvcrt.clean/.MainActivity --ez completeDecoderSpeedTest true
+```
 
 ## Current v1 Boundary
 
 The complete encoder runs ONNX graph sequences, source-derived CDF-index
 packing, native rANS, and SPS/I/P muxing. It compares I/P payloads and the
 final `encoded_ip.gvc` byte-for-byte with the server baseline. The complete
-decoder remains a post-entropy neural decode test until its rANS-to-prior path
-is connected.
+decoder parses that stream, incrementally decodes I's four and P's two prior
+stages from Android-generated CDF indexes, and compares decoded symbols,
+latents, reconstructed frames, and reference state against the server baseline.

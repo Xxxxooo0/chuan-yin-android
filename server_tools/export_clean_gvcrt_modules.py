@@ -22,10 +22,13 @@ import numpy as np
 import torch
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-root", default=r"D:\sever_chuanyin\GVC-RT_inference")
-    parser.add_argument("--output-assets", default=r"D:\android\ceshi\GVC-RT_clean_android\app\src\main\assets")
+    parser.add_argument("--source-root", default=os.environ.get("GVC_RT_SOURCE_ROOT"))
+    parser.add_argument("--output-assets", default=str(PROJECT_ROOT / "app" / "src" / "main" / "assets"))
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--qp", type=int, default=0)
@@ -39,7 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--i-frame-f32le")
     parser.add_argument("--p-frame-f32le")
     parser.add_argument("--force-zero-thres", type=float, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.source_root:
+        parser.error("--source-root is required, or set GVC_RT_SOURCE_ROOT")
+    return args
 
 
 def sha256_file(path: Path) -> str:
@@ -291,6 +297,15 @@ class IHyperPrior(torch.nn.Module):
         return params[:, :, :h, :w].contiguous()
 
 
+class IDecodeHyperPrior(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, i_z_hat):
+        return self.model.y_prior_fusion(self.model.hyper_dec(i_z_hat))
+
+
 class IPrior4x(torch.nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -306,6 +321,49 @@ class IPrior4x(torch.nn.Module):
             self.model.y_spatial_prior_adaptor_3,
             self.model.y_spatial_prior,
         )
+
+
+class IDecodePriorStage0(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, i_common_params, i_y_q_w_0):
+        _, _, scales, means = self.model.separate_prior(i_common_params, False)
+        batch, channels, height, width = means.shape
+        mask_0, _, _, _ = self.model.get_mask_4x(batch, channels, height, width, means.dtype, means.device)
+        scales_for_rans = self.model.single_part_for_writing_4x(scales * mask_0)
+        y_hat_so_far = (torch.cat((i_y_q_w_0, i_y_q_w_0, i_y_q_w_0, i_y_q_w_0), dim=1) + means) * mask_0
+        return scales_for_rans, y_hat_so_far
+
+
+class IDecodePriorStage(torch.nn.Module):
+    def __init__(self, model, stage: int):
+        super().__init__()
+        if stage not in (1, 2, 3):
+            raise ValueError(f"invalid I decode stage {stage}")
+        self.model = model
+        self.stage = stage
+
+    def forward(self, i_common_params, i_y_hat_so_far, i_y_q_w):
+        _, q_dec, _, means = self.model.separate_prior(i_common_params, False)
+        batch, channels, height, width = means.shape
+        _, mask_1, mask_2, mask_3 = self.model.get_mask_4x(batch, channels, height, width, means.dtype, means.device)
+        masks = (mask_1, mask_2, mask_3)
+        adaptors = (
+            self.model.y_spatial_prior_adaptor_1,
+            self.model.y_spatial_prior_adaptor_2,
+            self.model.y_spatial_prior_adaptor_3,
+        )
+        spatial_params = torch.cat((i_y_hat_so_far, self.model.y_spatial_prior_reduction(i_common_params)), dim=1)
+        scales, means = self.model.y_spatial_prior(adaptors[self.stage - 1](spatial_params)).chunk(2, 1)
+        mask = masks[self.stage - 1]
+        scales_for_rans = self.model.single_part_for_writing_4x(scales * mask)
+        current = (torch.cat((i_y_q_w, i_y_q_w, i_y_q_w, i_y_q_w), dim=1) + means) * mask
+        y_hat = i_y_hat_so_far + current
+        if self.stage == 3:
+            y_hat = y_hat * q_dec
+        return scales_for_rans, y_hat
 
 
 class IRecon(torch.nn.Module):
@@ -385,6 +443,35 @@ class PPrior2x(torch.nn.Module):
         return self.model.compress_prior_2x(p_y_pre_prior, p_common_params, self.model.y_spatial_prior)
 
 
+class PDecodePriorStage0(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, p_common_params, p_y_q_w_0):
+        _, scales, means = self.model.separate_prior_for_video_decoding(p_common_params)
+        batch, channels, height, width = means.shape
+        mask_0, _ = self.model.get_mask_2x(batch, channels, height, width, means.dtype, means.device)
+        scales_for_rans = self.model.single_part_for_writing_2x(scales * mask_0)
+        y_hat_so_far = (torch.cat((p_y_q_w_0, p_y_q_w_0), dim=1) + means) * mask_0
+        return scales_for_rans, y_hat_so_far
+
+
+class PDecodePriorStage1(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, p_common_params, p_y_hat_so_far, p_y_q_w_1):
+        q_dec, _, means = self.model.separate_prior_for_video_decoding(p_common_params)
+        batch, channels, height, width = means.shape
+        _, mask_1 = self.model.get_mask_2x(batch, channels, height, width, means.dtype, means.device)
+        scales, means = self.model.y_spatial_prior(torch.cat((p_y_hat_so_far, p_common_params), dim=1)).chunk(2, 1)
+        scales_for_rans = self.model.single_part_for_writing_2x(scales * mask_1)
+        current = (torch.cat((p_y_q_w_1, p_y_q_w_1), dim=1) + means) * mask_1
+        return scales_for_rans, (p_y_hat_so_far + current) * q_dec
+
+
 class PRecon(torch.nn.Module):
     def __init__(self, model, qp: int):
         super().__init__()
@@ -454,7 +541,12 @@ def main() -> None:
     i_encoder = IEncoderFront(i_model, args.qp).to(device).eval()
     i_hyper_enc = IHyperEnc(i_model).to(device).eval()
     i_hyper_prior = IHyperPrior(i_model).to(device).eval()
+    i_decode_hyper_prior = IDecodeHyperPrior(i_model).to(device).eval()
     i_prior = IPrior4x(i_model).to(device).eval()
+    i_decode_stage_0 = IDecodePriorStage0(i_model).to(device).eval()
+    i_decode_stage_1 = IDecodePriorStage(i_model, 1).to(device).eval()
+    i_decode_stage_2 = IDecodePriorStage(i_model, 2).to(device).eval()
+    i_decode_stage_3 = IDecodePriorStage(i_model, 3).to(device).eval()
     i_recon = IRecon(i_model, args.qp).to(device).eval()
     temporal_frame = TemporalFromFrame(p_model, args.qp).to(device).eval()
     temporal_feature = TemporalFromFeature(p_model, args.qp).to(device).eval()
@@ -462,6 +554,8 @@ def main() -> None:
     p_hyper_enc = PHyperEnc(p_model).to(device).eval()
     p_hyper_prior = PHyperPrior(p_model).to(device).eval()
     p_prior = PPrior2x(p_model).to(device).eval()
+    p_decode_stage_0 = PDecodePriorStage0(p_model).to(device).eval()
+    p_decode_stage_1 = PDecodePriorStage1(p_model).to(device).eval()
     p_recon = PRecon(p_model, args.qp).to(device).eval()
 
     with torch.no_grad():
@@ -469,6 +563,11 @@ def main() -> None:
         i_z, i_z_hat = i_hyper_enc(i_y)
         i_params = i_hyper_prior(i_z_hat, i_y)
         i_y_q0, i_y_q1, i_y_q2, i_y_q3, i_s0, i_s1, i_s2, i_s3, i_y_hat = i_prior(i_y, i_params)
+        i_decode_params = i_decode_hyper_prior(i_z_hat)
+        i_decode_s0, i_decode_y0 = i_decode_stage_0(i_decode_params, i_y_q0)
+        i_decode_s1, i_decode_y1 = i_decode_stage_1(i_decode_params, i_decode_y0, i_y_q1)
+        i_decode_s2, i_decode_y2 = i_decode_stage_2(i_decode_params, i_decode_y1, i_y_q2)
+        i_decode_s3, i_decode_y_hat = i_decode_stage_3(i_decode_params, i_decode_y2, i_y_q3)
         i_codeword, i_ref = i_recon(i_y_hat)
 
         p_feature_from_frame, p_ctx, p_ctx_t = temporal_frame(i_ref)
@@ -476,6 +575,8 @@ def main() -> None:
         p_z, p_z_hat = p_hyper_enc(p_y)
         p_params = p_hyper_prior(p_z_hat, p_ctx_t)
         p_y_q0, p_y_q1, p_s0, p_s1, p_y_hat = p_prior(p_y, p_params)
+        p_decode_s0, p_decode_y0 = p_decode_stage_0(p_params, p_y_q0)
+        p_decode_s1, p_decode_y_hat = p_decode_stage_1(p_params, p_decode_y0, p_y_q1)
         p_feature, p_ref = p_recon(p_y_hat, p_ctx)
         p_feature_from_feature, p_ctx_from_feature, p_ctx_t_from_feature = temporal_feature(p_feature)
 
@@ -493,6 +594,15 @@ def main() -> None:
         "i_s_w_2": i_s2,
         "i_s_w_3": i_s3,
         "i_y_hat": i_y_hat,
+        "i_decode_common_params": i_decode_params,
+        "i_decode_s_w_0": i_decode_s0,
+        "i_decode_s_w_1": i_decode_s1,
+        "i_decode_s_w_2": i_decode_s2,
+        "i_decode_s_w_3": i_decode_s3,
+        "i_y_hat_so_far_0": i_decode_y0,
+        "i_y_hat_so_far_1": i_decode_y1,
+        "i_y_hat_so_far_2": i_decode_y2,
+        "i_decode_y_hat": i_decode_y_hat,
         "i_codeword": i_codeword,
         "encoder_i_reference_frame": i_ref,
         "temporal_from_frame_feature": p_feature_from_frame,
@@ -507,6 +617,10 @@ def main() -> None:
         "p_s_w_0": p_s0,
         "p_s_w_1": p_s1,
         "p_y_hat": p_y_hat,
+        "p_decode_s_w_0": p_decode_s0,
+        "p_decode_s_w_1": p_decode_s1,
+        "p_y_hat_so_far_0": p_decode_y0,
+        "p_decode_y_hat": p_decode_y_hat,
         "encoder_p_reference_feature": p_feature,
         "encoder_p_reference_frame": p_ref,
         "temporal_from_feature_feature": p_feature_from_feature,
@@ -551,6 +665,7 @@ def main() -> None:
     export_onnx(i_encoder, models_dir / "i_encoder_front.onnx", (input_i,), ["input_i_frame"], ["i_y_pre_prior"], args.opset)
     export_onnx(i_hyper_enc, models_dir / "i_hyper_enc.onnx", (i_y,), ["i_y_pre_prior"], ["i_z_pre_quant", "i_z_hat"], args.opset)
     export_onnx(i_hyper_prior, models_dir / "i_hyper_prior.onnx", (i_z_hat, i_y), ["i_z_hat", "i_y_pre_prior"], ["i_common_params"], args.opset)
+    export_onnx(i_decode_hyper_prior, models_dir / "i_decode_hyper_prior.onnx", (i_z_hat,), ["i_z_hat"], ["i_common_params"], args.opset)
     export_onnx(
         i_prior,
         models_dir / "i_prior_4x.onnx",
@@ -559,6 +674,10 @@ def main() -> None:
         ["i_y_q_w_0", "i_y_q_w_1", "i_y_q_w_2", "i_y_q_w_3", "i_s_w_0", "i_s_w_1", "i_s_w_2", "i_s_w_3", "i_y_hat"],
         args.opset,
     )
+    export_onnx(i_decode_stage_0, models_dir / "i_decode_prior_stage_0.onnx", (i_decode_params, i_y_q0), ["i_common_params", "i_y_q_w_0"], ["i_s_w_0", "i_y_hat_so_far_0"], args.opset)
+    export_onnx(i_decode_stage_1, models_dir / "i_decode_prior_stage_1.onnx", (i_decode_params, i_decode_y0, i_y_q1), ["i_common_params", "i_y_hat_so_far_0", "i_y_q_w_1"], ["i_s_w_1", "i_y_hat_so_far_1"], args.opset)
+    export_onnx(i_decode_stage_2, models_dir / "i_decode_prior_stage_2.onnx", (i_decode_params, i_decode_y1, i_y_q2), ["i_common_params", "i_y_hat_so_far_1", "i_y_q_w_2"], ["i_s_w_2", "i_y_hat_so_far_2"], args.opset)
+    export_onnx(i_decode_stage_3, models_dir / "i_decode_prior_stage_3.onnx", (i_decode_params, i_decode_y2, i_y_q3), ["i_common_params", "i_y_hat_so_far_2", "i_y_q_w_3"], ["i_s_w_3", "i_y_hat"], args.opset)
     export_onnx(i_recon, models_dir / "i_recon.onnx", (i_y_hat,), ["i_y_hat"], ["i_codeword", "encoder_i_reference_frame"], args.opset)
     export_onnx(temporal_frame, models_dir / "temporal_from_frame.onnx", (i_ref,), ["reference_frame"], ["temporal_from_frame_feature", "p_ctx", "p_ctx_t"], args.opset)
     export_onnx(temporal_feature, models_dir / "temporal_from_feature.onnx", (p_feature,), ["reference_feature"], ["temporal_from_feature_feature", "p_ctx_from_feature", "p_ctx_t_from_feature"], args.opset)
@@ -573,6 +692,8 @@ def main() -> None:
         ["p_y_q_w_0", "p_y_q_w_1", "p_s_w_0", "p_s_w_1", "p_y_hat"],
         args.opset,
     )
+    export_onnx(p_decode_stage_0, models_dir / "p_decode_prior_stage_0.onnx", (p_params, p_y_q0), ["p_common_params", "p_y_q_w_0"], ["p_s_w_0", "p_y_hat_so_far_0"], args.opset)
+    export_onnx(p_decode_stage_1, models_dir / "p_decode_prior_stage_1.onnx", (p_params, p_decode_y0, p_y_q1), ["p_common_params", "p_y_hat_so_far_0", "p_y_q_w_1"], ["p_s_w_1", "p_y_hat"], args.opset)
     export_onnx(p_recon, models_dir / "p_recon.onnx", (p_y_hat, p_ctx), ["p_y_hat", "p_ctx"], ["encoder_p_reference_feature", "encoder_p_reference_frame"], args.opset)
 
     manifest = build_manifest(source_root, args, i_ckpt, p_ckpt, tensors, entropy_assets, stream)
@@ -653,26 +774,88 @@ def build_manifest(
         ),
         graph_step("p_recon", "models/p_recon.onnx", {"p_y_hat": source_spec("p_y_hat"), "p_ctx": source_spec("p_ctx")}, {"encoder_p_reference_feature": out("encoder_p_reference_feature"), "encoder_p_reference_frame": out("encoder_p_reference_frame")}),
     ]
-    decoder_steps = [
-        graph_step(
-            "decode_i_recon_from_server_y_hat",
-            "models/i_recon.onnx",
-            {"i_y_hat": tensor_spec(baseline("i_y_hat"), shape_of(tensors, "i_y_hat"))},
-            {"i_codeword": out("i_codeword"), "encoder_i_reference_frame": out("encoder_i_reference_frame")},
-        ),
-        graph_step(
-            "decode_p_temporal_from_i_reference_frame",
-            "models/temporal_from_frame.onnx",
-            {"reference_frame": source_spec("encoder_i_reference_frame")},
-            {"temporal_from_frame_feature": out("temporal_from_frame_feature"), "p_ctx": out("p_ctx"), "p_ctx_t": out("p_ctx_t")},
-        ),
-        graph_step(
-            "decode_p_recon_from_server_y_hat",
-            "models/p_recon.onnx",
-            {"p_y_hat": tensor_spec(baseline("p_y_hat"), shape_of(tensors, "p_y_hat")), "p_ctx": source_spec("p_ctx")},
-            {"encoder_p_reference_feature": out("encoder_p_reference_feature"), "encoder_p_reference_frame": out("encoder_p_reference_frame")},
-        ),
-    ]
+    decoder = {
+        "android_input": "outputs/encoded_ip.gvc",
+        "fallback_input": stream["path"],
+        "i": {
+            "z_shape": shape_of(tensors, "i_z_hat"),
+            "y_stage_shape": shape_of(tensors, "i_y_q_w_0"),
+            "hyper_prior": graph_step(
+                "decode_i_hyper_prior",
+                "models/i_decode_hyper_prior.onnx",
+                {"i_z_hat": source_spec("i_z_hat")},
+                {"i_common_params": out("i_common_params")},
+            ),
+            "stages": [
+                graph_step(
+                    "decode_i_prior_stage_0",
+                    "models/i_decode_prior_stage_0.onnx",
+                    {"i_common_params": source_spec("i_common_params"), "i_y_q_w_0": source_spec("i_y_q_w_0")},
+                    {"i_s_w_0": out("i_s_w_0"), "i_y_hat_so_far_0": out("i_y_hat_so_far_0")},
+                ),
+                graph_step(
+                    "decode_i_prior_stage_1",
+                    "models/i_decode_prior_stage_1.onnx",
+                    {"i_common_params": source_spec("i_common_params"), "i_y_hat_so_far_0": source_spec("i_y_hat_so_far_0"), "i_y_q_w_1": source_spec("i_y_q_w_1")},
+                    {"i_s_w_1": out("i_s_w_1"), "i_y_hat_so_far_1": out("i_y_hat_so_far_1")},
+                ),
+                graph_step(
+                    "decode_i_prior_stage_2",
+                    "models/i_decode_prior_stage_2.onnx",
+                    {"i_common_params": source_spec("i_common_params"), "i_y_hat_so_far_1": source_spec("i_y_hat_so_far_1"), "i_y_q_w_2": source_spec("i_y_q_w_2")},
+                    {"i_s_w_2": out("i_s_w_2"), "i_y_hat_so_far_2": out("i_y_hat_so_far_2")},
+                ),
+                graph_step(
+                    "decode_i_prior_stage_3",
+                    "models/i_decode_prior_stage_3.onnx",
+                    {"i_common_params": source_spec("i_common_params"), "i_y_hat_so_far_2": source_spec("i_y_hat_so_far_2"), "i_y_q_w_3": source_spec("i_y_q_w_3")},
+                    {"i_s_w_3": out("i_s_w_3"), "i_y_hat": out("i_y_hat")},
+                ),
+            ],
+            "recon": graph_step(
+                "decode_i_recon",
+                "models/i_recon.onnx",
+                {"i_y_hat": source_spec("i_y_hat")},
+                {"i_codeword": out("i_codeword"), "encoder_i_reference_frame": out("encoder_i_reference_frame")},
+            ),
+        },
+        "p": {
+            "z_shape": shape_of(tensors, "p_z_hat"),
+            "y_stage_shape": shape_of(tensors, "p_y_q_w_0"),
+            "temporal": graph_step(
+                "decode_p_temporal_from_i_reference_frame",
+                "models/temporal_from_frame.onnx",
+                {"reference_frame": source_spec("encoder_i_reference_frame")},
+                {"temporal_from_frame_feature": out("temporal_from_frame_feature"), "p_ctx": out("p_ctx"), "p_ctx_t": out("p_ctx_t")},
+            ),
+            "hyper_prior": graph_step(
+                "decode_p_hyper_prior",
+                "models/p_hyper_prior.onnx",
+                {"p_z_hat": source_spec("p_z_hat"), "p_ctx_t": source_spec("p_ctx_t")},
+                {"p_common_params": out("p_common_params")},
+            ),
+            "stages": [
+                graph_step(
+                    "decode_p_prior_stage_0",
+                    "models/p_decode_prior_stage_0.onnx",
+                    {"p_common_params": source_spec("p_common_params"), "p_y_q_w_0": source_spec("p_y_q_w_0")},
+                    {"p_s_w_0": out("p_s_w_0"), "p_y_hat_so_far_0": out("p_y_hat_so_far_0")},
+                ),
+                graph_step(
+                    "decode_p_prior_stage_1",
+                    "models/p_decode_prior_stage_1.onnx",
+                    {"p_common_params": source_spec("p_common_params"), "p_y_hat_so_far_0": source_spec("p_y_hat_so_far_0"), "p_y_q_w_1": source_spec("p_y_q_w_1")},
+                    {"p_s_w_1": out("p_s_w_1"), "p_y_hat": out("p_y_hat")},
+                ),
+            ],
+            "recon": graph_step(
+                "decode_p_recon",
+                "models/p_recon.onnx",
+                {"p_y_hat": source_spec("p_y_hat"), "p_ctx": source_spec("p_ctx")},
+                {"encoder_p_reference_feature": out("encoder_p_reference_feature"), "encoder_p_reference_frame": out("encoder_p_reference_frame")},
+            ),
+        },
+    }
     return {
         "schema_version": 1,
         "metadata": {
@@ -692,6 +875,7 @@ def build_manifest(
         },
         "entropy": entropy_assets,
         "stream": stream,
+        "decoder": decoder,
         "modules": {
             "temporal_reference": [
                 {
@@ -731,12 +915,9 @@ def build_manifest(
             ],
             "complete_decoder": [
                 {
-                    "name": "post_entropy_neural_decode_v1",
-                    "steps": decoder_steps,
-                    "binary_comparisons": [
-                        {"android": "outputs/decoded_i_y_hat.f32le", "baseline": baseline("i_y_hat")},
-                        {"android": "outputs/decoded_p_y_hat.f32le", "baseline": baseline("p_y_hat")},
-                    ],
+                    "name": "full_bitstream_decode_v2",
+                    "steps": [],
+                    "binary_comparisons": [],
                 }
             ],
         },

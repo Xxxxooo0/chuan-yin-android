@@ -9,10 +9,9 @@ Use the command below exactly; FP16 is deferred until every graph has a
 source-matched FP16 export path.
 
 ```bash
-cd /media/ltelab/D/weilingfeng/GVC-RT_inference
-python /media/ltelab/D/weilingfeng/GVC-RT_clean_android/server_tools/export_clean_gvcrt_modules.py \
-  --source-root /media/ltelab/D/weilingfeng/GVC-RT_inference \
-  --output-assets /media/ltelab/D/weilingfeng/GVC-RT_clean_android/app/src/main/assets \
+cd /media/ltelab/D/weilingfeng/GVC-RT_clean_android
+export GVC_RT_SOURCE_ROOT=/media/ltelab/D/weilingfeng/GVC-RT_inference
+python server_tools/export_clean_gvcrt_modules.py \
   --height 256 \
   --width 512 \
   --qp 0 \

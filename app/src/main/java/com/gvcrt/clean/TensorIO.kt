@@ -45,6 +45,20 @@ object TensorIO {
 
     fun readI8(bytes: ByteArray): ByteArray = bytes.copyOf()
 
+    fun fromI8(name: String, shape: LongArray, bytes: ByteArray): TensorValue {
+        val expected = shape.fold(1L) { acc, value -> acc * value }
+        require(bytes.size.toLong() == expected) {
+            "$name byte size mismatch: got=${bytes.size}, expected=$expected"
+        }
+        return TensorValue(name, shape, FloatArray(bytes.size) { bytes[it].toFloat() })
+    }
+
+    fun f32Le(tensor: TensorValue): ByteArray {
+        val bytes = ByteArray(tensor.data.size * 4)
+        ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().put(tensor.data)
+        return bytes
+    }
+
     fun diff(a: TensorValue, b: TensorValue): TensorDiff {
         require(a.data.size == b.data.size) {
             "${a.name}/${b.name} element mismatch: ${a.data.size} vs ${b.data.size}"

@@ -213,6 +213,57 @@ Java_com_gvcrt_clean_NativeRans_nativeDecode(
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_gvcrt_clean_NativeRans_nativeBeginDecode(
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jbyteArray payload)
+{
+    try {
+        RansSession* session = checkedSession(env, handle);
+        session->decoder.set_stream(copyU8(env, payload));
+    } catch (const std::exception& error) {
+        throwIllegalState(env, error.what());
+    }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_gvcrt_clean_NativeRans_nativeDecodeZ(
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jint zTotalSize,
+    jint zStartOffset,
+    jint zPerChannelSize)
+{
+    try {
+        RansSession* session = checkedSession(env, handle);
+        session->decoder.decode_z(zTotalSize, session->zGroup, zStartOffset, zPerChannelSize);
+        return makeByteArray(env, *session->decoder.get_decoded_tensor());
+    } catch (const std::exception& error) {
+        throwIllegalState(env, error.what());
+        return nullptr;
+    }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_gvcrt_clean_NativeRans_nativeDecodeY(
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jbyteArray indexes)
+{
+    try {
+        RansSession* session = checkedSession(env, handle);
+        session->decoder.decode_y(copyU8(env, indexes), session->gaussianGroup);
+        return makeByteArray(env, *session->decoder.get_decoded_tensor());
+    } catch (const std::exception& error) {
+        throwIllegalState(env, error.what());
+        return nullptr;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_gvcrt_clean_NativeRans_nativeRelease(JNIEnv*, jclass, jlong handle)
 {
     delete reinterpret_cast<RansSession*>(handle);
