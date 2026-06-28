@@ -1,17 +1,26 @@
 package com.gvcrt.clean
 
 import android.app.Activity
+import android.graphics.BitmapFactory
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.io.File
+import java.util.Locale
 
 class MainActivity : Activity() {
     private lateinit var output: TextView
     private lateinit var moduleButtons: List<Button>
+    private lateinit var imageComparison: LinearLayout
+    private lateinit var inputImage: ImageView
+    private lateinit var reconImage: ImageView
+    private lateinit var reconTitle: TextView
     private var running = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -80,11 +89,29 @@ class MainActivity : Activity() {
             addView(fullProjectButton, buttonLayoutParams())
             addView(imageInferenceButton, buttonLayoutParams())
         }
+        inputImage = comparisonImageView()
+        reconImage = comparisonImageView()
+        reconTitle = comparisonTitle("Reconstruction")
+        imageComparison = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(16, 8, 16, 8)
+            visibility = View.GONE
+            addView(imagePanel(comparisonTitle("Input"), inputImage), imagePanelLayoutParams())
+            addView(imagePanel(reconTitle, reconImage), imagePanelLayoutParams())
+        }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(controls)
             addView(speedControls)
             addView(projectControls)
+            addView(
+                imageComparison,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(180),
+                ),
+            )
             addView(
                 ScrollView(this@MainActivity).apply { addView(output) },
                 LinearLayout.LayoutParams(
@@ -128,6 +155,45 @@ class MainActivity : Activity() {
             setMargins(4, 0, 4, 0)
         }
 
+    private fun comparisonImageView(): ImageView =
+        ImageView(this).apply {
+            adjustViewBounds = true
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(0xFF101010.toInt())
+        }
+
+    private fun comparisonTitle(title: String): TextView =
+        TextView(this).apply {
+            text = title
+            gravity = Gravity.CENTER
+            textSize = 12f
+        }
+
+    private fun imagePanel(titleView: TextView, imageView: ImageView): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                titleView,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(24),
+                ),
+            )
+            addView(
+                imageView,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    0,
+                    1f,
+                ),
+            )
+        }
+
+    private fun imagePanelLayoutParams(): LinearLayout.LayoutParams =
+        LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f).apply {
+            setMargins(4, 0, 4, 0)
+        }
+
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private fun startTests(requested: List<String>) {
@@ -138,6 +204,10 @@ class MainActivity : Activity() {
         running = true
         moduleButtons.forEach { it.isEnabled = false }
         output.text = "GVC-RT clean deployment\n"
+        imageComparison.visibility = View.GONE
+        inputImage.setImageDrawable(null)
+        reconImage.setImageDrawable(null)
+        reconTitle.text = "Reconstruction"
         Thread {
             val result = StringBuilder()
             fun emit(line: String) {
@@ -148,6 +218,7 @@ class MainActivity : Activity() {
 
             try {
                 emit("requested_modules=${requested.joinToString(",")}")
+                val fullProjectRun = requested == FULL_PROJECT_MODULES
                 requested.forEach { moduleName ->
                     when {
                         moduleName == "image_inference" -> {
@@ -156,13 +227,22 @@ class MainActivity : Activity() {
                             } else {
                                 OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK
                             }
-                            ImageInferenceRunner(this, ::emit, backend).run(intent.getStringExtra("imagePath"))
+                            ImageInferenceRunner(this, ::emit, backend, ::showImageComparison)
+                                .run(intent.getStringExtra("imagePath"))
                         }
                         moduleName.endsWith("_speed") -> {
                             ModuleSpeedBenchmarks(this, ::emit).runModule(moduleName.removeSuffix("_speed"))
                         }
                         else -> {
-                            CleanModuleTests(this, ::emit).runModule(moduleName)
+                            if (fullProjectRun) {
+                                MemorySampler(this, ::emit).use { memory ->
+                                    memory.begin("full_project_$moduleName")
+                                    CleanModuleTests(this, ::emit).runModule(moduleName)
+                                    memory.mark("${moduleName}_complete")
+                                }
+                            } else {
+                                CleanModuleTests(this, ::emit).runModule(moduleName)
+                            }
                         }
                     }
                 }
@@ -176,6 +256,17 @@ class MainActivity : Activity() {
                 }
             }
         }.start()
+    }
+
+    private fun showImageComparison(inputFile: File, reconFile: File, psnr: Double) {
+        val input = BitmapFactory.decodeFile(inputFile.absolutePath)
+        val recon = BitmapFactory.decodeFile(reconFile.absolutePath)
+        runOnUiThread {
+            inputImage.setImageBitmap(input)
+            reconImage.setImageBitmap(recon)
+            reconTitle.text = "Reconstruction PSNR ${String.format(Locale.US, "%.2f", psnr)} dB"
+            imageComparison.visibility = View.VISIBLE
+        }
     }
 
     companion object {

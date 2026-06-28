@@ -68,12 +68,38 @@ The second button row runs device-only speed benchmarks. Each benchmark keeps
 the ONNX sessions and CDF tables warm, performs 5 warmup runs, and reports 50
 measured samples as mean, p50, p90, and fps. Session initialization, baseline
 comparison, and output-file writes are excluded from measured samples.
+Speed tests also print process RAM diagnostics as `memory_start`,
+`memory_mark`, `memory_peak`, and `memory_end`. These include Android PSS,
+Java/native heap, RSS/HWM, and system available memory.
 
 ```powershell
 & $adb shell am start -n com.gvcrt.clean/.MainActivity --ez temporalReferenceSpeedTest true
 & $adb shell am start -n com.gvcrt.clean/.MainActivity --ez completeEncoderSpeedTest true
 & $adb shell am start -n com.gvcrt.clean/.MainActivity --ez completeDecoderSpeedTest true
 ```
+
+## RAM And GPU Diagnostics
+
+The app can reliably report its own RAM usage, but Android does not expose a
+stable per-app GPU/NPU memory API to ordinary apps. GPU memory in app logs is
+therefore reported as unavailable unless the device exposes it through system
+dumpsys/procfs commands.
+
+Use these adb commands after or during a benchmark run for best-effort external
+diagnostics:
+
+```powershell
+& $adb shell dumpsys meminfo com.gvcrt.clean
+& $adb shell dumpsys gfxinfo com.gvcrt.clean
+& $adb shell dumpsys SurfaceFlinger
+& $adb shell cat /proc/meminfo
+& $adb shell cat /sys/kernel/dmabuf/buffers 2>/dev/null
+```
+
+On some devices, `dumpsys meminfo` contains `Graphics`, `GL`, `EGL mtrack`, or
+dmabuf-related rows. If those fields are absent or permission denied, treat GPU
+memory as `unavailable_on_this_device`; do not infer GPU/NPU usage only from
+NNAPI being enabled.
 
 ## Current v1 Boundary
 

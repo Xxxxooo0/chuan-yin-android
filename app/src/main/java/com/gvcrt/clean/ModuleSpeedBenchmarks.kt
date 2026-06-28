@@ -6,7 +6,7 @@ import java.util.Locale
 import kotlin.math.ceil
 
 class ModuleSpeedBenchmarks(
-    context: Context,
+    private val context: Context,
     private val emit: (String) -> Unit,
     private val backend: OnnxBackend = OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK,
 ) {
@@ -201,20 +201,26 @@ class ModuleSpeedBenchmarks(
 
     private fun benchmark(label: String, framesPerRun: Int, runOnce: (StageTimer) -> Unit) {
         emit("speed_start label=$label warmup=$WARMUP_RUNS measured=$MEASURED_RUNS frames_per_run=$framesPerRun")
-        repeat(WARMUP_RUNS) { runOnce(StageTimer()) }
+        MemorySampler(context, emit).use { memory ->
+            memory.begin(label)
+            repeat(WARMUP_RUNS) { runOnce(StageTimer()) }
+            memory.mark("warmup_complete")
 
-        val totals = ArrayList<Long>(MEASURED_RUNS)
-        val stages = linkedMapOf<String, MutableList<Long>>()
-        repeat(MEASURED_RUNS) {
-            val timer = StageTimer()
-            val started = SystemClock.elapsedRealtimeNanos()
-            runOnce(timer)
-            totals += SystemClock.elapsedRealtimeNanos() - started
-            timer.values.forEach { (name, elapsed) -> stages.getOrPut(name) { ArrayList() } += elapsed }
+            val totals = ArrayList<Long>(MEASURED_RUNS)
+            val stages = linkedMapOf<String, MutableList<Long>>()
+            repeat(MEASURED_RUNS) {
+                val timer = StageTimer()
+                val started = SystemClock.elapsedRealtimeNanos()
+                runOnce(timer)
+                totals += SystemClock.elapsedRealtimeNanos() - started
+                timer.values.forEach { (name, elapsed) -> stages.getOrPut(name) { ArrayList() } += elapsed }
+            }
+            memory.mark("measured_complete")
+
+            emitSpeedSummary(label, "total", totals, framesPerRun)
+            stages.forEach { (name, values) -> emitSpeedSummary(label, name, values, null) }
+            memory.end()
         }
-
-        emitSpeedSummary(label, "total", totals, framesPerRun)
-        stages.forEach { (name, values) -> emitSpeedSummary(label, name, values, null) }
         emit("speed_complete label=$label")
     }
 

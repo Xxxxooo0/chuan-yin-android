@@ -13,6 +13,7 @@ class ImageInferenceRunner(
     private val context: Context,
     private val emit: (String) -> Unit,
     private val backend: OnnxBackend = OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK,
+    private val showImages: ((File, File, Double) -> Unit)? = null,
 ) {
     private val store = AssetStore(context)
     private val manifest = CleanManifest.parse(store.readBytes(MANIFEST).decodeToString())
@@ -29,6 +30,7 @@ class ImageInferenceRunner(
             "image_inference_source=${image.source} original=${image.originalWidth}x${image.originalHeight} " +
                 "tensor_shape=${TensorIO.shapeText(image.tensor.shape)} backend=${backend.label}"
         )
+        val memory = MemorySampler(context, emit)
 
         val case = manifest.modules["complete_encoder"]?.singleOrNull()
             ?: error("missing canonical complete encoder case")
@@ -41,6 +43,7 @@ class ImageInferenceRunner(
         val iRans = createRans(iEntropy)
         val pRans = createRans(pEntropy)
         try {
+            memory.begin("image_inference")
             OnnxSessionRunner(store, backend).use { runner ->
                 emit("image_speed_note=single_run_includes_lazy_onnx_session_creation")
                 val started = SystemClock.elapsedRealtimeNanos()
@@ -54,6 +57,7 @@ class ImageInferenceRunner(
                 )
                 val iPayload = encodeEntropy("i", iEntropy, tensors, 4, iRans, timer)
                 val pPayload = encodeEntropy("p", pEntropy, tensors, 2, pRans, timer)
+                memory.mark("encode_complete")
                 val bitstream = timer.measure("stream_mux") { GvcStreamMuxer.mux(stream, iPayload, pPayload) }
                 store.writeOutput("outputs/image_inference_encoded_ip.gvc", bitstream)
                 emit(
@@ -62,15 +66,21 @@ class ImageInferenceRunner(
                 )
 
                 val decoded = decodeBitstream(bitstream, decoder, stream, iEntropy, pEntropy, iRans, pRans, runner, timer)
+                memory.mark("decode_complete")
                 emitQuality("i_recon_vs_input", inputI, decoded.getValue("encoder_i_reference_frame"))
                 val finalOutput = decoded.getValue("encoder_p_reference_frame")
-                emitQuality("p_recon_vs_input", inputP, finalOutput)
-                emit("image_output=${writeFinalOutputPng(finalOutput).absolutePath}")
+                val finalPsnr = emitQuality("p_recon_vs_input", inputP, finalOutput)
+                val inputFile = writeTensorPng(inputP, "image_input.png")
+                val outputFile = writeTensorPng(finalOutput, "image_reconstruction.png")
+                emit("image_input=${inputFile.absolutePath}")
+                emit("image_output=${outputFile.absolutePath}")
+                showImages?.invoke(inputFile, outputFile, finalPsnr)
                 totalNs = SystemClock.elapsedRealtimeNanos() - started
             }
         } finally {
             iRans.close()
             pRans.close()
+            memory.close()
         }
 
         emit("image_speed stage=total ms=${formatMs(totalNs)}")
@@ -205,7 +215,7 @@ class ImageInferenceRunner(
             input.tensorName to tensor
         }
 
-    private fun emitQuality(label: String, input: TensorValue, reconstruction: TensorValue) {
+    private fun emitQuality(label: String, input: TensorValue, reconstruction: TensorValue): Double {
         require(input.data.size == reconstruction.data.size) {
             "$label element mismatch: ${input.data.size} vs ${reconstruction.data.size}"
         }
@@ -228,9 +238,10 @@ class ImageInferenceRunner(
             "image_quality $label max_abs=${formatFloat(maxAbs)} mean_abs=${formatFloat(meanAbs)} " +
                 "rmse=${formatFloat(rmse)} psnr_db=${formatFloat(psnr)}"
         )
+        return psnr
     }
 
-    private fun writeFinalOutputPng(tensor: TensorValue): File {
+    private fun writeTensorPng(tensor: TensorValue, fileName: String): File {
         require(tensor.shape.size == 4 && tensor.shape[0] == 1L && tensor.shape[1] == 3L) {
             "expected NCHW RGB tensor, got ${TensorIO.shapeText(tensor.shape)}"
         }
@@ -254,7 +265,7 @@ class ImageInferenceRunner(
         }
         val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "outputs")
         dir.mkdirs()
-        val file = File(dir, "image_reconstruction.png")
+        val file = File(dir, fileName)
         file.outputStream().use { output ->
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
         }
