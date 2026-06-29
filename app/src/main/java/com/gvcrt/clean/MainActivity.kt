@@ -2,6 +2,7 @@ package com.gvcrt.clean
 
 import android.app.Activity
 import android.graphics.BitmapFactory
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
@@ -22,6 +23,8 @@ class MainActivity : Activity() {
     private lateinit var reconImage: ImageView
     private lateinit var reconTitle: TextView
     private var running = false
+    private var imageRunner: ImageInferenceRunner? = null
+    private var imageRunnerBackend: OnnxBackend? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -123,7 +126,23 @@ class MainActivity : Activity() {
         }
         setContentView(root)
 
-        val requested = when {
+        val requested = requestedModules(intent)
+        if (requested.isNotEmpty()) {
+            startTests(requested)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val requested = requestedModules(intent)
+        if (requested.isNotEmpty()) {
+            startTests(requested)
+        }
+    }
+
+    private fun requestedModules(intent: Intent): List<String> =
+        when {
             intent.getBooleanExtra("temporalReferenceTest", false) -> listOf("temporal_reference")
             intent.getBooleanExtra("completeEncoderTest", false) -> listOf("complete_encoder")
             intent.getBooleanExtra("completeDecoderTest", false) -> listOf("complete_decoder")
@@ -134,10 +153,6 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("imageInferenceTest", false) -> listOf("image_inference")
             else -> emptyList()
         }
-        if (requested.isNotEmpty()) {
-            startTests(requested)
-        }
-    }
 
     private fun moduleButton(label: String, onClick: () -> Unit): Button =
         Button(this).apply {
@@ -227,8 +242,7 @@ class MainActivity : Activity() {
                             } else {
                                 OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK
                             }
-                            ImageInferenceRunner(this, ::emit, backend, ::showImageComparison)
-                                .run(intent.getStringExtra("imagePath"))
+                            imageRunnerFor(backend, ::emit).run(intent.getStringExtra("imagePath"))
                         }
                         moduleName.endsWith("_speed") -> {
                             ModuleSpeedBenchmarks(this, ::emit).runModule(moduleName.removeSuffix("_speed"))
@@ -258,6 +272,20 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    private fun imageRunnerFor(
+        backend: OnnxBackend,
+        emit: (String) -> Unit,
+    ): ImageInferenceRunner {
+        if (imageRunnerBackend != backend) {
+            imageRunner?.close()
+            imageRunner = null
+            imageRunnerBackend = backend
+        }
+        return imageRunner ?: ImageInferenceRunner(this, emit, backend, ::showImageComparison).also {
+            imageRunner = it
+        }
+    }
+
     private fun showImageComparison(inputFile: File, reconFile: File, psnr: Double) {
         val input = BitmapFactory.decodeFile(inputFile.absolutePath)
         val recon = BitmapFactory.decodeFile(reconFile.absolutePath)
@@ -267,6 +295,12 @@ class MainActivity : Activity() {
             reconTitle.text = "Reconstruction PSNR ${String.format(Locale.US, "%.2f", psnr)} dB"
             imageComparison.visibility = View.VISIBLE
         }
+    }
+
+    override fun onDestroy() {
+        imageRunner?.close()
+        imageRunner = null
+        super.onDestroy()
     }
 
     companion object {

@@ -14,9 +14,10 @@ class ImageInferenceRunner(
     private val emit: (String) -> Unit,
     private val backend: OnnxBackend = OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK,
     private val showImages: ((File, File, Double) -> Unit)? = null,
-) {
+) : AutoCloseable {
     private val store = AssetStore(context)
     private val manifest = CleanManifest.parse(store.readBytes(MANIFEST).decodeToString())
+    private val runner = OnnxSessionRunner(store, backend)
 
     init {
         require(manifest.metadata.optString("precision") == "fp32") {
@@ -44,39 +45,37 @@ class ImageInferenceRunner(
         val pRans = createRans(pEntropy)
         try {
             memory.begin("image_inference")
-            OnnxSessionRunner(store, backend).use { runner ->
-                emit("image_speed_note=single_run_includes_lazy_onnx_session_creation")
-                val started = SystemClock.elapsedRealtimeNanos()
-                val inputI = image.tensor.renamed("input_i_frame")
-                val inputP = image.tensor.renamed("input_p_frame")
-                val tensors = runGraphSteps(
-                    runner,
-                    case.steps,
-                    preloadStaticInputs(case.steps, mapOf(inputI.name to inputI, inputP.name to inputP)),
-                    timer,
-                )
-                val iPayload = encodeEntropy("i", iEntropy, tensors, 4, iRans, timer)
-                val pPayload = encodeEntropy("p", pEntropy, tensors, 2, pRans, timer)
-                memory.mark("encode_complete")
-                val bitstream = timer.measure("stream_mux") { GvcStreamMuxer.mux(stream, iPayload, pPayload) }
-                store.writeOutput("outputs/image_inference_encoded_ip.gvc", bitstream)
-                emit(
-                    "image_bitstream path=outputs/image_inference_encoded_ip.gvc bytes=${bitstream.size} " +
-                        "sha256=${AssetStore.sha256(bitstream)}"
-                )
+            emit("image_speed_note=onnx_sessions_reused_until_activity_destroyed")
+            val started = SystemClock.elapsedRealtimeNanos()
+            val inputI = image.tensor.renamed("input_i_frame")
+            val inputP = image.tensor.renamed("input_p_frame")
+            val tensors = runGraphSteps(
+                runner,
+                case.steps,
+                preloadStaticInputs(case.steps, mapOf(inputI.name to inputI, inputP.name to inputP)),
+                timer,
+            )
+            val iPayload = encodeEntropy("i", iEntropy, tensors, 4, iRans, timer)
+            val pPayload = encodeEntropy("p", pEntropy, tensors, 2, pRans, timer)
+            memory.mark("encode_complete")
+            val bitstream = timer.measure("stream_mux") { GvcStreamMuxer.mux(stream, iPayload, pPayload) }
+            store.writeOutput("outputs/image_inference_encoded_ip.gvc", bitstream)
+            emit(
+                "image_bitstream path=outputs/image_inference_encoded_ip.gvc bytes=${bitstream.size} " +
+                    "sha256=${AssetStore.sha256(bitstream)}"
+            )
 
-                val decoded = decodeBitstream(bitstream, decoder, stream, iEntropy, pEntropy, iRans, pRans, runner, timer)
-                memory.mark("decode_complete")
-                emitQuality("i_recon_vs_input", inputI, decoded.getValue("encoder_i_reference_frame"))
-                val finalOutput = decoded.getValue("encoder_p_reference_frame")
-                val finalPsnr = emitQuality("p_recon_vs_input", inputP, finalOutput)
-                val inputFile = writeTensorPng(inputP, "image_input.png")
-                val outputFile = writeTensorPng(finalOutput, "image_reconstruction.png")
-                emit("image_input=${inputFile.absolutePath}")
-                emit("image_output=${outputFile.absolutePath}")
-                showImages?.invoke(inputFile, outputFile, finalPsnr)
-                totalNs = SystemClock.elapsedRealtimeNanos() - started
-            }
+            val decoded = decodeBitstream(bitstream, decoder, stream, iEntropy, pEntropy, iRans, pRans, runner, timer)
+            memory.mark("decode_complete")
+            emitQuality("i_recon_vs_input", inputI, decoded.getValue("encoder_i_reference_frame"))
+            val finalOutput = decoded.getValue("encoder_p_reference_frame")
+            val finalPsnr = emitQuality("p_recon_vs_input", inputP, finalOutput)
+            val inputFile = writeTensorPng(inputP, "image_input.png")
+            val outputFile = writeTensorPng(finalOutput, "image_reconstruction.png")
+            emit("image_input=${inputFile.absolutePath}")
+            emit("image_output=${outputFile.absolutePath}")
+            showImages?.invoke(inputFile, outputFile, finalPsnr)
+            totalNs = SystemClock.elapsedRealtimeNanos() - started
         } finally {
             iRans.close()
             pRans.close()
@@ -88,6 +87,10 @@ class ImageInferenceRunner(
             emit("image_speed stage=$stage ms=${formatMs(elapsedNs)}")
         }
         emit("image_inference_status=PASS")
+    }
+
+    override fun close() {
+        runner.close()
     }
 
     private fun decodeBitstream(
