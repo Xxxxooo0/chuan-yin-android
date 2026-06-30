@@ -22,6 +22,8 @@ class MainActivity : Activity() {
     private lateinit var inputImage: ImageView
     private lateinit var reconImage: ImageView
     private lateinit var reconTitle: TextView
+    private lateinit var imageSummary: TextView
+    private val imageSummaryLines = linkedMapOf<String, String>()
     private var running = false
     private var imageRunner: ImageInferenceRunner? = null
     private var imageRunnerBackend: OnnxBackend? = null
@@ -103,6 +105,11 @@ class MainActivity : Activity() {
             addView(imagePanel(comparisonTitle("Input"), inputImage), imagePanelLayoutParams())
             addView(imagePanel(reconTitle, reconImage), imagePanelLayoutParams())
         }
+        imageSummary = TextView(this).apply {
+            textSize = 12f
+            setPadding(24, 0, 24, 8)
+            visibility = View.GONE
+        }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(controls)
@@ -113,6 +120,13 @@ class MainActivity : Activity() {
                 LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     dp(180),
+                ),
+            )
+            addView(
+                imageSummary,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
                 ),
             )
             addView(
@@ -220,6 +234,9 @@ class MainActivity : Activity() {
         moduleButtons.forEach { it.isEnabled = false }
         output.text = "GVC-RT clean deployment\n"
         imageComparison.visibility = View.GONE
+        imageSummary.visibility = View.GONE
+        imageSummary.text = ""
+        imageSummaryLines.clear()
         inputImage.setImageDrawable(null)
         reconImage.setImageDrawable(null)
         reconTitle.text = "Reconstruction"
@@ -228,7 +245,10 @@ class MainActivity : Activity() {
             fun emit(line: String) {
                 Log.i(TAG, line)
                 result.append(line).append('\n')
-                runOnUiThread { output.text = result.toString() }
+                runOnUiThread {
+                    updateImageSummary(line)
+                    output.text = result.toString()
+                }
             }
 
             try {
@@ -293,8 +313,47 @@ class MainActivity : Activity() {
             inputImage.setImageBitmap(input)
             reconImage.setImageBitmap(recon)
             reconTitle.text = "Reconstruction PSNR ${String.format(Locale.US, "%.2f", psnr)} dB"
-            imageComparison.visibility = View.VISIBLE
+        imageComparison.visibility = View.VISIBLE
         }
+    }
+
+    private fun updateImageSummary(line: String) {
+        when {
+            line.startsWith("image_inference_source=") -> {
+                val backend = line.substringAfter("backend=", "")
+                if (backend.isNotBlank()) imageSummaryLines["Backend"] = "Backend: $backend"
+            }
+            line.startsWith("image_quality p_recon_vs_input") -> {
+                imageSummaryLines["PSNR"] = "PSNR: ${line.valueAfter("psnr_db")} dB"
+            }
+            line.startsWith("image_speed stage=total") -> {
+                imageSummaryLines["Total"] = "Total: ${line.valueAfter("ms")} ms"
+            }
+            line.startsWith("image_memory_peak") ||
+                line.startsWith("memory_peak label=image_inference") -> {
+                imageSummaryLines["Peak"] =
+                    "Peak RAM: PSS ${line.valueAfter("total_pss_mb")} MB, " +
+                        "native ${line.valueAfter("native_pss_mb")} MB, RSS ${line.valueAfter("rss_mb")} MB"
+            }
+            line.startsWith("image_memory_end") ||
+                line.startsWith("memory_end label=image_inference") -> {
+                imageSummaryLines["End"] =
+                    "End RAM: PSS ${line.valueAfter("total_pss_mb")} MB, " +
+                        "native heap ${line.valueAfter("native_heap_mb")} MB, low_memory=${line.valueAfter("low_memory")}"
+            }
+            line.startsWith("gpu_memory=") -> {
+                imageSummaryLines["GPU"] = "GPU memory: unavailable from app API; use adb dumpsys meminfo"
+            }
+        }
+        if (imageSummaryLines.isNotEmpty()) {
+            imageSummary.text = imageSummaryLines.values.joinToString("\n")
+            imageSummary.visibility = View.VISIBLE
+        }
+    }
+
+    private fun String.valueAfter(key: String): String {
+        val prefix = "$key="
+        return substringAfter(prefix, "").substringBefore(" ").ifBlank { "n/a" }
     }
 
     override fun onDestroy() {
