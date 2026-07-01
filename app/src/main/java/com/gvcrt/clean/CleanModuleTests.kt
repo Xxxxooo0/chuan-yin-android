@@ -279,13 +279,20 @@ class CleanModuleTests(
 
         val gaussian = CdfTable.load(store, entropy.gaussian)
         val zTable = CdfTable.load(store, entropy.z)
-        NativeRans.create(gaussian, zTable).use { rans ->
-            val payload = rans.encode(z, entropy.zStartOffset, entropy.zPerChannelSize, packedStages)
+        RansNativeEncoder.create(gaussian, zTable, entropy.twoEntropyCoders).use { encoder ->
+            encoder.encodeZ(z, entropy.zStartOffset, entropy.zPerChannelSize)
+            repeat(stageCount) { stage ->
+                encoder.encodeY(tensors.getValue("${prefix}_y_q_w_$stage"), tensors.getValue("${prefix}_s_w_$stage"))
+            }
+            val payload = encoder.flush()
             store.writeOutput("outputs/${prefix}_rans_payload.bin", payload)
             emitBinaryComparison("outputs/${prefix}_rans_payload.bin", entropy.payload)
 
+        }
+
+        NativeRans.create(gaussian, zTable).use { rans ->
             val decoded = rans.decode(
-                payload,
+                store.readOutput("outputs/${prefix}_rans_payload.bin"),
                 z.size,
                 entropy.zStartOffset,
                 entropy.zPerChannelSize,

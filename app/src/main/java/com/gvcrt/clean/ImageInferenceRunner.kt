@@ -41,6 +41,8 @@ class ImageInferenceRunner(
         val pEntropy = manifest.entropy["p"] ?: error("missing P rANS assets")
         val timer = StageTimer()
         var totalNs = 0L
+        val iEncoderRans = createRansEncoder(iEntropy)
+        val pEncoderRans = createRansEncoder(pEntropy)
         val iRans = createRans(iEntropy)
         val pRans = createRans(pEntropy)
         try {
@@ -55,8 +57,8 @@ class ImageInferenceRunner(
                 preloadStaticInputs(case.steps, mapOf(inputI.name to inputI, inputP.name to inputP)),
                 timer,
             )
-            val iPayload = encodeEntropy("i", iEntropy, tensors, 4, iRans, timer)
-            val pPayload = encodeEntropy("p", pEntropy, tensors, 2, pRans, timer)
+            val iPayload = encodeEntropy("i", iEntropy, tensors, 4, iEncoderRans, timer)
+            val pPayload = encodeEntropy("p", pEntropy, tensors, 2, pEncoderRans, timer)
             memory.mark("encode_complete")
             val bitstream = timer.measure("stream_mux") { GvcStreamMuxer.mux(stream, iPayload, pPayload) }
             store.writeOutput("outputs/image_inference_encoded_ip.gvc", bitstream)
@@ -77,6 +79,8 @@ class ImageInferenceRunner(
             showImages?.invoke(inputFile, outputFile, finalPsnr)
             totalNs = SystemClock.elapsedRealtimeNanos() - started
         } finally {
+            iEncoderRans.close()
+            pEncoderRans.close()
             iRans.close()
             pRans.close()
             memory.close()
@@ -155,18 +159,34 @@ class ImageInferenceRunner(
         entropy: EntropySpec,
         tensors: Map<String, TensorValue>,
         stageCount: Int,
-        rans: NativeRans,
+        rans: RansNativeEncoder,
         timer: StageTimer,
-    ): ByteArray = timer.measure("${prefix}_rans") {
-        val z = EntropySymbols.zSymbols(tensors.getValue("${prefix}_z_hat"))
-        val packedStages = Array(stageCount) { stage ->
-            EntropySymbols.packY(
-                tensors.getValue("${prefix}_y_q_w_$stage"),
-                tensors.getValue("${prefix}_s_w_$stage"),
-            )
+    ): ByteArray {
+        val z = timer.measure("${prefix}_rans_z_prepare") {
+            EntropySymbols.zSymbols(tensors.getValue("${prefix}_z_hat"))
         }
-        rans.encode(z, entropy.zStartOffset, entropy.zPerChannelSize, packedStages)
+        timer.measure("${prefix}_rans_z") {
+            rans.encodeZ(z, entropy.zStartOffset, entropy.zPerChannelSize)
+        }
+        repeat(stageCount) { stage ->
+            timer.measure("${prefix}_rans_y_$stage") {
+                rans.encodeY(
+                    tensors.getValue("${prefix}_y_q_w_$stage"),
+                    tensors.getValue("${prefix}_s_w_$stage"),
+                )
+            }
+        }
+        return timer.measure("${prefix}_rans_flush") {
+            rans.flush()
+        }
     }
+
+    private fun createRansEncoder(entropy: EntropySpec): RansNativeEncoder =
+        RansNativeEncoder.create(
+            CdfTable.load(store, entropy.gaussian),
+            CdfTable.load(store, entropy.z),
+            entropy.twoEntropyCoders,
+        )
 
     private fun createRans(entropy: EntropySpec): NativeRans =
         NativeRans.create(CdfTable.load(store, entropy.gaussian), CdfTable.load(store, entropy.z))

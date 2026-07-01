@@ -1,5 +1,7 @@
 #include <jni.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -32,6 +34,97 @@ struct RansSession {
             throw std::runtime_error("rANS encoder/decoder CDF group mismatch");
         }
     }
+};
+
+class AndroidRansEncoder {
+public:
+    AndroidRansEncoder()
+        : encoder0_(std::make_shared<RansEncoderLibMultiThread>())
+        , encoder1_(std::make_shared<RansEncoderLibMultiThread>())
+    {
+    }
+
+    void setUseTwoEncoders(bool enabled) { useTwoEncoders_ = enabled; }
+
+    int addCdf(const CdfData& cdf)
+    {
+        const int idx0 = encoder0_->add_cdf(cdf.cdfs, cdf.lengths, cdf.offsets);
+        encoder1_->add_cdf(cdf.cdfs, cdf.lengths, cdf.offsets);
+        return idx0;
+    }
+
+    void encodeY(const std::shared_ptr<std::vector<int16_t>> symbols, int cdfGroupIndex)
+    {
+        if (useTwoEncoders_) {
+            const int size0 = static_cast<int>(symbols->size()) / 2;
+            auto symbols0 = std::make_shared<std::vector<int16_t>>(symbols->begin(), symbols->begin() + size0);
+            auto symbols1 = std::make_shared<std::vector<int16_t>>(symbols->begin() + size0, symbols->end());
+            encoder0_->encode_y(symbols0, cdfGroupIndex);
+            encoder1_->encode_y(symbols1, cdfGroupIndex);
+        } else {
+            encoder0_->encode_y(symbols, cdfGroupIndex);
+        }
+    }
+
+    void encodeZ(const std::shared_ptr<std::vector<int8_t>> symbols,
+                 int cdfGroupIndex,
+                 int startOffset,
+                 int perChannelSize)
+    {
+        if (useTwoEncoders_) {
+            const int size0 = static_cast<int>(symbols->size()) / 2;
+            const int channelHalf = size0 / perChannelSize;
+            auto symbols0 = std::make_shared<std::vector<int8_t>>(symbols->begin(), symbols->begin() + size0);
+            auto symbols1 = std::make_shared<std::vector<int8_t>>(symbols->begin() + size0, symbols->end());
+            encoder0_->encode_z(symbols0, cdfGroupIndex, startOffset, perChannelSize);
+            encoder1_->encode_z(symbols1, cdfGroupIndex, startOffset + channelHalf, perChannelSize);
+        } else {
+            encoder0_->encode_z(symbols, cdfGroupIndex, startOffset, perChannelSize);
+        }
+    }
+
+    std::vector<uint8_t> flush()
+    {
+        encoder0_->flush();
+        encoder1_->flush();
+        if (!useTwoEncoders_) {
+            std::vector<uint8_t> output = *encoder0_->get_encoded_stream();
+            encoder0_->reset();
+            encoder1_->reset();
+            return output;
+        }
+
+        auto result0 = encoder0_->get_encoded_stream();
+        auto result1 = encoder1_->get_encoded_stream();
+        const int nbytes0 = static_cast<int>(result0->size());
+        const int nbytes1 = static_cast<int>(result1->size());
+
+        int identicalBytes = 0;
+        const int checkBytes = std::min(std::min(nbytes0, nbytes1), 8);
+        for (int i = 0; i < checkBytes; ++i) {
+            if (result0->at(nbytes0 - 1 - i) != 0 || result1->at(nbytes1 - 1 - i) != 0) {
+                break;
+            }
+            identicalBytes++;
+        }
+        if (identicalBytes == 0 && nbytes0 > 0 && nbytes1 > 0 &&
+            result0->at(nbytes0 - 1) == result1->at(nbytes1 - 1)) {
+            identicalBytes = 1;
+        }
+
+        std::vector<uint8_t> stream(static_cast<size_t>(nbytes0 + nbytes1 - identicalBytes));
+        std::copy(result0->begin(), result0->end(), stream.begin());
+        std::copy(result1->rbegin() + identicalBytes, result1->rend(),
+                  stream.begin() + static_cast<std::ptrdiff_t>(nbytes0));
+        encoder0_->reset();
+        encoder1_->reset();
+        return stream;
+    }
+
+private:
+    std::shared_ptr<RansEncoderLib> encoder0_;
+    std::shared_ptr<RansEncoderLib> encoder1_;
+    bool useTwoEncoders_{false};
 };
 
 void throwIllegalState(JNIEnv* env, const char* message)
@@ -93,6 +186,42 @@ std::shared_ptr<std::vector<int16_t>> copyI16(JNIEnv* env, jshortArray source)
     return std::make_shared<std::vector<int16_t>>(raw.begin(), raw.end());
 }
 
+std::shared_ptr<std::vector<int16_t>> packYFromFloat(JNIEnv* env, jfloatArray symbols, jfloatArray scales)
+{
+    const jsize size = env->GetArrayLength(symbols);
+    if (env->GetArrayLength(scales) != size) {
+        throw std::invalid_argument("symbol and scale size mismatch");
+    }
+    std::vector<jfloat> symbolValues(size);
+    std::vector<jfloat> scaleValues(size);
+    env->GetFloatArrayRegion(symbols, 0, size, symbolValues.data());
+    env->GetFloatArrayRegion(scales, 0, size, scaleValues.data());
+
+    constexpr float scaleMin = 0.11f;
+    constexpr float scaleMax = 16.0f;
+    constexpr float logScaleMin = -2.2072749f;
+    constexpr float logStepRecip = 25.502707f;
+
+    auto packed = std::make_shared<std::vector<int16_t>>(size);
+    for (jsize i = 0; i < size; ++i) {
+        const int symbol = static_cast<int>(symbolValues[i]);
+        float scale = scaleValues[i];
+        if (scale < scaleMin) {
+            scale = scaleMin;
+        } else if (scale > scaleMax) {
+            scale = scaleMax;
+        }
+        int cdfIndex = static_cast<int>((std::log(scale) - logScaleMin) * logStepRecip);
+        if (cdfIndex < 0) {
+            cdfIndex = 0;
+        } else if (cdfIndex > 127) {
+            cdfIndex = 127;
+        }
+        packed->at(i) = static_cast<int16_t>((symbol << 8) + cdfIndex);
+    }
+    return packed;
+}
+
 jbyteArray makeByteArray(JNIEnv* env, const std::vector<int8_t>& values)
 {
     jbyteArray output = env->NewByteArray(static_cast<jsize>(values.size()));
@@ -115,6 +244,14 @@ RansSession* checkedSession(JNIEnv* env, jlong handle)
         throw std::invalid_argument("rANS session is closed");
     }
     return reinterpret_cast<RansSession*>(handle);
+}
+
+AndroidRansEncoder* checkedEncoder(JNIEnv* env, jlong handle)
+{
+    if (handle == 0) {
+        throw std::invalid_argument("rANS encoder is closed");
+    }
+    return reinterpret_cast<AndroidRansEncoder*>(handle);
 }
 
 }  // namespace
@@ -141,6 +278,115 @@ Java_com_gvcrt_clean_NativeRans_nativeCreate(
     } catch (const std::exception& error) {
         throwIllegalState(env, error.what());
         return 0;
+    }
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_gvcrt_clean_RansNativeEncoder_nativeCreateEncoder(JNIEnv* env, jclass)
+{
+    try {
+        return reinterpret_cast<jlong>(new AndroidRansEncoder());
+    } catch (const std::exception& error) {
+        throwIllegalState(env, error.what());
+        return 0;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_gvcrt_clean_RansNativeEncoder_nativeDestroyEncoder(JNIEnv*, jclass, jlong handle)
+{
+    delete reinterpret_cast<AndroidRansEncoder*>(handle);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_gvcrt_clean_RansNativeEncoder_nativeSetUseTwoEncoders(
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jboolean enabled)
+{
+    try {
+        checkedEncoder(env, handle)->setUseTwoEncoders(enabled == JNI_TRUE);
+    } catch (const std::exception& error) {
+        throwIllegalState(env, error.what());
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_gvcrt_clean_RansNativeEncoder_nativeAddCdf(
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jintArray flatCdfs,
+    jint rows,
+    jint cols,
+    jintArray cdfSizes,
+    jintArray offsets)
+{
+    try {
+        return checkedEncoder(env, handle)->addCdf(copyCdf(env, flatCdfs, rows, cols, cdfSizes, offsets));
+    } catch (const std::exception& error) {
+        throwIllegalState(env, error.what());
+        return -1;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_gvcrt_clean_RansNativeEncoder_nativeEncodeY(
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jshortArray symbols,
+    jint cdfGroupIndex)
+{
+    try {
+        checkedEncoder(env, handle)->encodeY(copyI16(env, symbols), cdfGroupIndex);
+    } catch (const std::exception& error) {
+        throwIllegalState(env, error.what());
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_gvcrt_clean_RansNativeEncoder_nativeEncodeYFromFloat(
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jfloatArray symbols,
+    jfloatArray scales,
+    jint cdfGroupIndex)
+{
+    try {
+        checkedEncoder(env, handle)->encodeY(packYFromFloat(env, symbols, scales), cdfGroupIndex);
+    } catch (const std::exception& error) {
+        throwIllegalState(env, error.what());
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_gvcrt_clean_RansNativeEncoder_nativeEncodeZ(
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jbyteArray symbols,
+    jint cdfGroupIndex,
+    jint startOffset,
+    jint perChannelSize)
+{
+    try {
+        checkedEncoder(env, handle)->encodeZ(copyI8(env, symbols), cdfGroupIndex, startOffset, perChannelSize);
+    } catch (const std::exception& error) {
+        throwIllegalState(env, error.what());
+    }
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_gvcrt_clean_RansNativeEncoder_nativeFlush(JNIEnv* env, jclass, jlong handle)
+{
+    try {
+        return makeByteArray(env, checkedEncoder(env, handle)->flush());
+    } catch (const std::exception& error) {
+        throwIllegalState(env, error.what());
+        return nullptr;
     }
 }
 

@@ -48,8 +48,8 @@ class ModuleSpeedBenchmarks(
         val pEntropy = manifest.entropy["p"] ?: error("missing P rANS assets")
         val stream = manifest.stream ?: error("missing stream specification")
         val staticInputs = preloadStaticInputs(case.steps)
-        val iRans = createRans(iEntropy)
-        val pRans = createRans(pEntropy)
+        val iRans = createRansEncoder(iEntropy)
+        val pRans = createRansEncoder(pEntropy)
         try {
             OnnxSessionRunner(store, backend).use { runner ->
                 benchmark("complete_encoder", 2) { timer ->
@@ -142,18 +142,34 @@ class ModuleSpeedBenchmarks(
         entropy: EntropySpec,
         tensors: Map<String, TensorValue>,
         stageCount: Int,
-        rans: NativeRans,
+        rans: RansNativeEncoder,
         timer: StageTimer,
-    ): ByteArray = timer.measure("${prefix}_rans") {
-        val z = EntropySymbols.zSymbols(tensors.getValue("${prefix}_z_hat"))
-        val packedStages = Array(stageCount) { stage ->
-            EntropySymbols.packY(
-                tensors.getValue("${prefix}_y_q_w_$stage"),
-                tensors.getValue("${prefix}_s_w_$stage"),
-            )
+    ): ByteArray {
+        val z = timer.measure("${prefix}_rans_z_prepare") {
+            EntropySymbols.zSymbols(tensors.getValue("${prefix}_z_hat"))
         }
-        rans.encode(z, entropy.zStartOffset, entropy.zPerChannelSize, packedStages)
+        timer.measure("${prefix}_rans_z") {
+            rans.encodeZ(z, entropy.zStartOffset, entropy.zPerChannelSize)
+        }
+        repeat(stageCount) { stage ->
+            timer.measure("${prefix}_rans_y_$stage") {
+                rans.encodeY(
+                    tensors.getValue("${prefix}_y_q_w_$stage"),
+                    tensors.getValue("${prefix}_s_w_$stage"),
+                )
+            }
+        }
+        return timer.measure("${prefix}_rans_flush") {
+            rans.flush()
+        }
     }
+
+    private fun createRansEncoder(entropy: EntropySpec): RansNativeEncoder =
+        RansNativeEncoder.create(
+            CdfTable.load(store, entropy.gaussian),
+            CdfTable.load(store, entropy.z),
+            entropy.twoEntropyCoders,
+        )
 
     private fun createRans(entropy: EntropySpec): NativeRans =
         NativeRans.create(CdfTable.load(store, entropy.gaussian), CdfTable.load(store, entropy.z))
