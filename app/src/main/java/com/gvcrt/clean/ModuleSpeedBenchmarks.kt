@@ -9,6 +9,8 @@ class ModuleSpeedBenchmarks(
     private val context: Context,
     private val emit: (String) -> Unit,
     private val backend: OnnxBackend = OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK,
+    private val warmupRuns: Int = DEFAULT_WARMUP_RUNS,
+    private val measuredRuns: Int = DEFAULT_MEASURED_RUNS,
 ) {
     private val store = AssetStore(context)
     private val manifest = CleanManifest.parse(store.readBytes(MANIFEST).decodeToString())
@@ -20,7 +22,7 @@ class ModuleSpeedBenchmarks(
     }
 
     fun runModule(moduleName: String) {
-        emit("speed_module=$moduleName backend=${backend.label} warmup=$WARMUP_RUNS measured=$MEASURED_RUNS")
+        emit("speed_module=$moduleName backend=${backend.label} warmup=$warmupRuns measured=$measuredRuns")
         when (moduleName) {
             "temporal_reference" -> runTemporalReference()
             "complete_encoder" -> runCompleteEncoder()
@@ -216,15 +218,15 @@ class ModuleSpeedBenchmarks(
         }
 
     private fun benchmark(label: String, framesPerRun: Int, runOnce: (StageTimer) -> Unit) {
-        emit("speed_start label=$label warmup=$WARMUP_RUNS measured=$MEASURED_RUNS frames_per_run=$framesPerRun")
+        emit("speed_start label=$label warmup=$warmupRuns measured=$measuredRuns frames_per_run=$framesPerRun")
         MemorySampler(context, emit).use { memory ->
             memory.begin(label)
-            repeat(WARMUP_RUNS) { runOnce(StageTimer()) }
+            repeat(warmupRuns) { runOnce(StageTimer()) }
             memory.mark("warmup_complete")
 
-            val totals = ArrayList<Long>(MEASURED_RUNS)
+            val totals = ArrayList<Long>(measuredRuns)
             val stages = linkedMapOf<String, MutableList<Long>>()
-            repeat(MEASURED_RUNS) {
+            repeat(measuredRuns) {
                 val timer = StageTimer()
                 val started = SystemClock.elapsedRealtimeNanos()
                 runOnce(timer)
@@ -292,7 +294,7 @@ class ModuleSpeedBenchmarks(
 
     companion object {
         private const val MANIFEST = "gvcrt_clean_manifest.json"
-        private const val WARMUP_RUNS = 5
-        private const val MEASURED_RUNS = 50
+        private const val DEFAULT_WARMUP_RUNS = 5
+        private const val DEFAULT_MEASURED_RUNS = 50
     }
 }

@@ -60,6 +60,9 @@ class MainActivity : Activity() {
         val imageInferenceButton = moduleButton("Image\ninfer") {
             startTests(listOf("image_inference"))
         }
+        val reconMnnButton = moduleButton("Recon\nMNN") {
+            startTests(listOf("recon_mnn_diagnostic"))
+        }
         moduleButtons = listOf(
             temporalButton,
             encoderButton,
@@ -69,6 +72,7 @@ class MainActivity : Activity() {
             decoderSpeedButton,
             fullProjectButton,
             imageInferenceButton,
+            reconMnnButton,
         )
 
         val controls = LinearLayout(this).apply {
@@ -93,6 +97,7 @@ class MainActivity : Activity() {
             setPadding(16, 0, 16, 0)
             addView(fullProjectButton, buttonLayoutParams())
             addView(imageInferenceButton, buttonLayoutParams())
+            addView(reconMnnButton, buttonLayoutParams())
         }
         inputImage = comparisonImageView()
         reconImage = comparisonImageView()
@@ -165,6 +170,8 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("completeDecoderSpeedTest", false) -> listOf("complete_decoder_speed")
             intent.getBooleanExtra("fullProjectTest", false) -> FULL_PROJECT_MODULES
             intent.getBooleanExtra("imageInferenceTest", false) -> listOf("image_inference")
+            intent.getBooleanExtra("reconDiagnosticTest", false) -> listOf("recon_diagnostic")
+            intent.getBooleanExtra("reconMnnDiagnosticTest", false) -> listOf("recon_mnn_diagnostic")
             else -> emptyList()
         }
 
@@ -264,8 +271,33 @@ class MainActivity : Activity() {
                             }
                             imageRunnerFor(backend, ::emit).run(intent.getStringExtra("imagePath"))
                         }
+                        moduleName == "recon_diagnostic" -> {
+                            ReconDiagnosticBenchmark(this, ::emit).run(
+                                labelFilter = intent.getStringExtra("reconDiagLabel"),
+                                createOnly = intent.getBooleanExtra("reconDiagCreateOnly", false),
+                                copyOutputs = !intent.getBooleanExtra("reconDiagNoOutputCopy", false),
+                                accelerationMode = intent.getIntExtra(
+                                    "reconDiagAccelerationMode",
+                                    MtkTfliteRuntime.ACCELERATION_NEURON,
+                                ),
+                                warmupRuns = intent.getIntExtra("reconDiagWarmup", 5),
+                                measuredRuns = intent.getIntExtra("reconDiagMeasured", 20),
+                            )
+                        }
+                        moduleName == "recon_mnn_diagnostic" -> {
+                            MnnReconDiagnosticBenchmark(this, ::emit).run(
+                                labelFilter = intent.getStringExtra("reconMnnLabel"),
+                                warmupRuns = intent.getIntExtra("reconMnnWarmup", 5),
+                                measuredRuns = intent.getIntExtra("reconMnnMeasured", 20),
+                            )
+                        }
                         moduleName.endsWith("_speed") -> {
-                            ModuleSpeedBenchmarks(this, ::emit).runModule(moduleName.removeSuffix("_speed"))
+                            ModuleSpeedBenchmarks(
+                                this,
+                                ::emit,
+                                warmupRuns = intent.getIntExtra("speedWarmup", 5),
+                                measuredRuns = intent.getIntExtra("speedMeasured", 50),
+                            ).runModule(moduleName.removeSuffix("_speed"))
                         }
                         else -> {
                             if (fullProjectRun) {

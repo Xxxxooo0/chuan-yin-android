@@ -9,9 +9,13 @@ app/.cxx/
 build/
 
 *.zip
+*.rar
+__pycache__/
 
 app/src/main/assets/models/
 app/src/main/assets/baseline/
+app/src/main/assets/recon_mnn/
 app/src/main/assets/gvcrt_clean_manifest.json
 sdk/
 outputs/
+mtk/

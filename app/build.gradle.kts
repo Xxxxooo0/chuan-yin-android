@@ -23,8 +23,16 @@ android {
 
     sourceSets {
         getByName("main") {
-            assets.srcDirs("src/main/assets")
+            if (project.hasProperty("gvcrtSkipAssets")) {
+                assets.setSrcDirs(emptyList<String>())
+            } else {
+                assets.srcDirs("src/main/assets")
+            }
         }
+    }
+
+    androidResources {
+        noCompress += listOf("tflite", "onnx", "mnn", "bin", "f32le", "gvc", "dla")
     }
 
     externalNativeBuild {
@@ -44,5 +52,9 @@ kotlin {
 }
 
 dependencies {
+    implementation(files("../mtk/Android_V_neuropilot_240408.aar"))
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.17.0")
 }

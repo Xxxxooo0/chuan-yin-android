@@ -1,0 +1,96 @@
+{
+  "route": "existing_onnx_to_tflite",
+  "records": [
+    {
+      "name": "i_recon_full",
+      "variant": "fp32",
+      "status": "ok",
+      "onnx": "/media/ltelab/D/weilingfeng/GVC-RT_clean_android/app/src/main/assets/models/i_recon.onnx",
+      "onnx_sha256": "6c58557f71922bc8074809b4246148a4d5e73c8e28d1b67c3452d1e287a9689a",
+      "tflite": "/media/ltelab/D/weilingfeng/GVC-RT_clean_android/outputs/full_recon_tflite/i_recon_full_fp32.tflite",
+      "tflite_sha256": "85dd1a5c531cb5ae9071db0adc8c7fe126a4b7841e7609e58b13ae4998badfc7",
+      "converter_log": "/media/ltelab/D/weilingfeng/GVC-RT_clean_android/outputs/full_recon_tflite/logs/i_recon_full_fp32_onnx_converter.log",
+      "inputs": [
+        {
+          "name": "i_y_hat",
+          "shape": [
+            1,
+            256,
+            16,
+            32
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "i_codeword",
+          "shape": [
+            1,
+            18,
+            16,
+            32
+          ]
+        },
+        {
+          "name": "encoder_i_reference_frame",
+          "shape": [
+            1,
+            3,
+            256,
+            512
+          ]
+        }
+      ]
+    },
+    {
+      "name": "p_recon_full",
+      "variant": "fp32",
+      "status": "ok",
+      "onnx": "/media/ltelab/D/weilingfeng/GVC-RT_clean_android/app/src/main/assets/models/p_recon.onnx",
+      "onnx_sha256": "6f23cc0137526d746bc39ca6a1f8d3db81085a4db759c5385fd1772234c78a9f",
+      "tflite": "/media/ltelab/D/weilingfeng/GVC-RT_clean_android/outputs/full_recon_tflite/p_recon_full_fp32.tflite",
+      "tflite_sha256": "2c121e2d7116fefc28844433862d0a233ff094f9bbb73fc97a4e166fd890d9bb",
+      "converter_log": "/media/ltelab/D/weilingfeng/GVC-RT_clean_android/outputs/full_recon_tflite/logs/p_recon_full_fp32_onnx_converter.log",
+      "inputs": [
+        {
+          "name": "p_y_hat",
+          "shape": [
+            1,
+            128,
+            16,
+            32
+          ]
+        },
+        {
+          "name": "p_ctx",
+          "shape": [
+            1,
+            256,
+            32,
+            64
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "name": "encoder_p_reference_feature",
+          "shape": [
+            1,
+            256,
+            32,
+            64
+          ]
+        },
+        {
+          "name": "encoder_p_reference_frame",
+          "shape": [
+            1,
+            3,
+            256,
+            512
+          ]
+        }
+      ]
+    }
+  ]
+}

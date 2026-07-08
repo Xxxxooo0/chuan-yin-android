@@ -1,0 +1,52 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputBuffer {
+    float inputData[];
+};
+
+layout(std430, binding = 1) readonly buffer WeightBuffer {
+    float weightData[];
+};
+
+layout(std430, binding = 2) readonly buffer BiasBuffer {
+    float biasData[];
+};
+
+layout(std430, binding = 3) writeonly buffer OutputBuffer {
+    float outputData[];
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= 512u * 32u * 64u) {
+        return;
+    }
+    uint ow = gid % 64u;
+    uint oh = (gid / 64u) % 32u;
+    uint oc = gid / (32u * 64u);
+    uint ihCenter = oh >> 1u;
+    uint iwCenter = ow >> 1u;
+    uint phase = ((oh & 1u) << 1u) + (ow & 1u);
+    uint convOc = oc * 4u + phase;
+    float sum = biasData[convOc];
+    for (uint ic = 0u; ic < 512u; ++ic) {
+        for (uint kh = 0u; kh < 3u; ++kh) {
+            int ih = int(ihCenter) + int(kh) - 1;
+            if (ih < 0 || ih >= 16) {
+                continue;
+            }
+            for (uint kw = 0u; kw < 3u; ++kw) {
+                int iw = int(iwCenter) + int(kw) - 1;
+                if (iw < 0 || iw >= 32) {
+                    continue;
+                }
+                uint inputIndex = (ic * 16u + uint(ih)) * 32u + uint(iw);
+                uint weightIndex = ((convOc * 512u + ic) * 3u + kh) * 3u + kw;
+                sum += inputData[inputIndex] * weightData[weightIndex];
+            }
+        }
+    }
+    outputData[gid] = sum;
+}
