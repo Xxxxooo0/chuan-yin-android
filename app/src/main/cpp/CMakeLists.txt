@@ -4,6 +4,8 @@ project(gvcrt_clean_rans)
 add_library(
     gvcrt_clean_rans
     SHARED
+    i_prior_npu_jni.cpp
+    neuron_adapter_jni.cpp
     mtk_tflite_jni.cpp
     rans_jni.cpp
     rans/rans.cpp

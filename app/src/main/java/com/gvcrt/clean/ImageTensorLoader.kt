@@ -14,7 +14,7 @@ data class ImageTensorInput(
 )
 
 object ImageTensorLoader {
-    private const val DEFAULT_ASSET = "sample/sample_input.png"
+    private const val DEFAULT_ASSET = "sample/park_scene_im00001.png"
     private const val HEIGHT = 256
     private const val WIDTH = 512
 

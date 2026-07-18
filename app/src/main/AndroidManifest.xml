@@ -3,7 +3,7 @@
     <application
         android:allowBackup="false"
         android:largeHeap="true"
-        android:label="GVC-RT Clean"
+        android:label="@string/app_name"
         android:theme="@style/AppTheme">
         <activity
             android:name=".MainActivity"

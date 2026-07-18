@@ -17,7 +17,7 @@ class ImageInferenceRunner(
 ) : AutoCloseable {
     private val store = AssetStore(context)
     private val manifest = CleanManifest.parse(store.readBytes(MANIFEST).decodeToString())
-    private val runner = OnnxSessionRunner(store, backend)
+    private val runner = ProcessOnnxSessionCache.get(context, backend)
 
     init {
         require(manifest.metadata.optString("precision") == "fp32") {
@@ -25,7 +25,7 @@ class ImageInferenceRunner(
         }
     }
 
-    fun run(imagePath: String?) {
+    fun run(imagePath: String?, decodeFromBitstream: Boolean = false) {
         val image = ImageTensorLoader.load(context, imagePath)
         emit(
             "image_inference_source=${image.source} original=${image.originalWidth}x${image.originalHeight} " +
@@ -34,27 +34,33 @@ class ImageInferenceRunner(
         val memory = MemorySampler(context, emit)
 
         val case = manifest.modules["complete_encoder"]?.singleOrNull()
-            ?: error("missing canonical complete encoder case")
+            ?: error("missing image inference encoder case")
+        emit("image_graph_variant=legacy_multi_session encoder_steps=${case.steps.size}")
         val decoder = manifest.decoder ?: error("missing decoder specification")
         val stream = manifest.stream ?: error("missing stream specification")
         val iEntropy = manifest.entropy["i"] ?: error("missing I rANS assets")
         val pEntropy = manifest.entropy["p"] ?: error("missing P rANS assets")
         val timer = StageTimer()
         var totalNs = 0L
+        var coreCodecNs = 0L
         val iEncoderRans = createRansEncoder(iEntropy)
         val pEncoderRans = createRansEncoder(pEntropy)
-        val iRans = createRans(iEntropy)
-        val pRans = createRans(pEntropy)
+        val iRans = if (decodeFromBitstream) createRans(iEntropy) else null
+        val pRans = if (decodeFromBitstream) createRans(pEntropy) else null
         try {
             memory.begin("image_inference")
             emit("image_speed_note=onnx_sessions_reused_until_activity_destroyed")
             val started = SystemClock.elapsedRealtimeNanos()
             val inputI = image.tensor.renamed("input_i_frame")
             val inputP = image.tensor.renamed("input_p_frame")
+            val staticInputs = timer.measure("static_inputs") {
+                preloadStaticInputs(case.steps, mapOf(inputI.name to inputI, inputP.name to inputP))
+            }
+            val codecStarted = SystemClock.elapsedRealtimeNanos()
             val tensors = runGraphSteps(
                 runner,
                 case.steps,
-                preloadStaticInputs(case.steps, mapOf(inputI.name to inputI, inputP.name to inputP)),
+                staticInputs,
                 timer,
             )
             val iPayload = encodeEntropy("i", iEntropy, tensors, 4, iEncoderRans, timer)
@@ -67,26 +73,52 @@ class ImageInferenceRunner(
                     "sha256=${AssetStore.sha256(bitstream)}"
             )
 
-            val decoded = decodeBitstream(bitstream, decoder, stream, iEntropy, pEntropy, iRans, pRans, runner, timer)
-            memory.mark("decode_complete")
-            emitQuality("i_recon_vs_input", inputI, decoded.getValue("encoder_i_reference_frame"))
-            val finalOutput = decoded.getValue("encoder_p_reference_frame")
-            val finalPsnr = emitQuality("p_recon_vs_input", inputP, finalOutput)
-            val inputFile = writeTensorPng(inputP, "image_input.png")
-            val outputFile = writeTensorPng(finalOutput, "image_reconstruction.png")
+            val reconstructed = if (decodeFromBitstream) {
+                emit("image_reconstruction_source=decoded_bitstream")
+                decodeBitstream(
+                    bitstream,
+                    decoder,
+                    stream,
+                    iEntropy,
+                    pEntropy,
+                    iRans ?: error("missing I rANS decoder"),
+                    pRans ?: error("missing P rANS decoder"),
+                    runner,
+                    timer,
+                )
+            } else {
+                emit("image_reconstruction_source=encoder_local_reference")
+                tensors
+            }
+            coreCodecNs = SystemClock.elapsedRealtimeNanos() - codecStarted
+            memory.mark("reconstruction_complete")
+            timer.measure("quality_metrics") {
+                emitQuality("i_recon_vs_input", inputI, reconstructed.getValue("encoder_i_reference_frame"))
+            }
+            val finalOutput = reconstructed.getValue("encoder_p_reference_frame")
+            val finalPsnr = timer.measure("quality_metrics") {
+                emitQuality("p_recon_vs_input", inputP, finalOutput)
+            }
+            val (inputFile, outputFile) = timer.measure("png_output") {
+                writeTensorPng(inputP, "image_input.png") to
+                    writeTensorPng(finalOutput, "image_reconstruction.png")
+            }
             emit("image_input=${inputFile.absolutePath}")
             emit("image_output=${outputFile.absolutePath}")
-            showImages?.invoke(inputFile, outputFile, finalPsnr)
+            timer.measure("ui_image_publish") {
+                showImages?.invoke(inputFile, outputFile, finalPsnr)
+            }
             totalNs = SystemClock.elapsedRealtimeNanos() - started
         } finally {
             iEncoderRans.close()
             pEncoderRans.close()
-            iRans.close()
-            pRans.close()
+            iRans?.close()
+            pRans?.close()
             memory.close()
         }
 
         emit("image_speed stage=total ms=${formatMs(totalNs)}")
+        emit("image_speed stage=core_codec ms=${formatMs(coreCodecNs)}")
         timer.values.forEach { (stage, elapsedNs) ->
             emit("image_speed stage=$stage ms=${formatMs(elapsedNs)}")
         }
@@ -94,7 +126,7 @@ class ImageInferenceRunner(
     }
 
     override fun close() {
-        runner.close()
+        // The process cache owns the runner so Activity recreation keeps sessions warm.
     }
 
     private fun decodeBitstream(
@@ -272,20 +304,18 @@ class ImageInferenceRunner(
         val width = tensor.shape[3].toInt()
         val plane = height * width
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(plane)
         for (y in 0 until height) {
             for (x in 0 until width) {
                 val offset = y * width + x
-                bitmap.setPixel(
-                    x,
-                    y,
-                    Color.rgb(
-                        tensor.data[offset].toByteRange(),
-                        tensor.data[plane + offset].toByteRange(),
-                        tensor.data[2 * plane + offset].toByteRange(),
-                    ),
+                pixels[offset] = Color.rgb(
+                    tensor.data[offset].toByteRange(),
+                    tensor.data[plane + offset].toByteRange(),
+                    tensor.data[2 * plane + offset].toByteRange(),
                 )
             }
         }
+        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
         val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "outputs")
         dir.mkdirs()
         val file = File(dir, fileName)

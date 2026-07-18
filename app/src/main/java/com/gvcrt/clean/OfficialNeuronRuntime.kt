@@ -45,10 +45,14 @@ class OfficialNeuronRuntime private constructor(
     }
 
     companion object {
-        fun create(tfliteFile: File, cacheDir: File): OfficialNeuronRuntime {
+        fun create(
+            tfliteFile: File,
+            cacheDir: File,
+            allowFp16ForFp32: Boolean = true,
+        ): OfficialNeuronRuntime {
             cacheDir.mkdirs()
             val delegateOptions = NeuronDelegate.Options()
-                .setAllowFp16(true)
+                .setAllowFp16(allowFp16ForFp32)
                 .setExecutionPreference(NeuronDelegate.Options.EXECUTION_PREFERENCE_SUSTAINED_SPEED)
             val delegate = NeuronDelegate(delegateOptions)
             val options = Interpreter.Options().addDelegate(delegate)
@@ -67,7 +71,7 @@ class OfficialNeuronRuntime private constructor(
                 outputSizes = LongArray(interpreter.outputTensorCount) { index ->
                     interpreter.getOutputTensor(index).numBytes().toLong()
                 },
-                optionsSummary = "NeuronDelegate(allowFp16,sustainedSpeed)",
+                optionsSummary = "NeuronDelegate(allowFp16=$allowFp16ForFp32,sustainedSpeed)",
             )
         }
 

@@ -1,0 +1,7 @@
+{
+  "deployment_path": "onnx_demo",
+  "neural_runtime": "onnxruntime",
+  "model_root": "models",
+  "codec_runtime": "native_rans",
+  "purpose": "demo_and_reconstruction_validation"
+}

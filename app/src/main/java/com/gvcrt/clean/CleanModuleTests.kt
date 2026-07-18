@@ -6,9 +6,11 @@ import org.json.JSONObject
 class CleanModuleTests(
     context: Context,
     private val emit: (String) -> Unit,
+    private val backend: OnnxBackend = OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK,
 ) {
     private val store = AssetStore(context)
     private val manifest = CleanManifest.parse(store.readBytes(MANIFEST).decodeToString())
+    private val precisionFailures = mutableListOf<String>()
 
     init {
         require(manifest.metadata.optString("precision") == "fp32") {
@@ -17,17 +19,20 @@ class CleanModuleTests(
     }
 
     fun runModule(moduleName: String) {
+        precisionFailures.clear()
         emit("module=$moduleName")
+        emit("precision_backend=${backend.label}")
         emitMetadata()
         if (moduleName == "complete_decoder") {
             runCompleteDecoder()
-            return
+        } else {
+            val cases = manifest.modules[moduleName]
+                ?: error("module '$moduleName' is not present in $MANIFEST")
+            OnnxSessionRunner(store, backend).use { runner ->
+                cases.forEach { runCase(runner, moduleName, it) }
+            }
         }
-        val cases = manifest.modules[moduleName]
-            ?: error("module '$moduleName' is not present in $MANIFEST")
-        OnnxSessionRunner(store).use { runner ->
-            cases.forEach { runCase(runner, moduleName, it) }
-        }
+        finishModule(moduleName)
     }
 
     private fun runCase(runner: OnnxSessionRunner, moduleName: String, case: ModuleCase) {
@@ -55,6 +60,7 @@ class CleanModuleTests(
                         "mean_abs=${"%.8f".format(diff.meanAbs)} " +
                         "rmse=${"%.8f".format(diff.rmse)}"
                 )
+                recordFailure("tensor:${spec.tensorName}", passed)
             }
         }
         if (moduleName == "complete_encoder") {
@@ -65,6 +71,7 @@ class CleanModuleTests(
                 emitBinaryComparison(androidPath, baselinePath)
             } else {
                 emit("binary_compare android=$androidPath baseline=$baselinePath status=deferred")
+                recordFailure("binary:$androidPath:missing", false)
             }
         }
     }
@@ -103,7 +110,7 @@ class CleanModuleTests(
         emitBinaryComparison("decoder_p_payload", parsed.pPayload, store.readBytes(pEntropy.payload))
 
         val tensors = linkedMapOf<String, TensorValue>()
-        OnnxSessionRunner(store).use { runner ->
+        OnnxSessionRunner(store, backend).use { runner ->
             decodeEntropyPath("i", parsed.iPayload, iEntropy, decoder.i, runner, tensors)
             val iRecon = runDecoderStep(runner, decoder.i.recon, tensors)
             tensors.putAll(iRecon)
@@ -121,7 +128,6 @@ class CleanModuleTests(
             writeTensorOutput("outputs/decoder_p_reference_feature.f32le", tensors.getValue("encoder_p_reference_feature"))
             writeTensorOutput("outputs/decoder_p_reference_frame.f32le", tensors.getValue("encoder_p_reference_frame"))
         }
-        emit("complete_decoder_status=PASS")
     }
 
     private fun decodeEntropyPath(
@@ -222,7 +228,7 @@ class CleanModuleTests(
     private fun emitAndRequireDiscreteComparison(name: String, actual: TensorValue, expected: TensorValue) {
         val diff = TensorIO.diff(actual, expected)
         emit("compare=$name kind=discrete pass=${diff.exact} exact=${diff.exact} first_diff=${firstDifference(actual, expected)}")
-        require(diff.exact) { "$name differs from the server baseline" }
+        recordFailure("tensor:$name", diff.exact)
     }
 
     private fun emitTensorComparison(name: String, actual: TensorValue, expected: TensorValue) {
@@ -234,6 +240,7 @@ class CleanModuleTests(
                 "pass=$passed exact=${diff.exact} max_abs=${"%.8f".format(diff.maxAbs)} " +
                 "mean_abs=${"%.8f".format(diff.meanAbs)} rmse=${"%.8f".format(diff.rmse)}"
         )
+        recordFailure("tensor:$name", passed)
     }
 
     private fun firstDifference(actual: TensorValue, expected: TensorValue): Int =
@@ -320,6 +327,7 @@ class CleanModuleTests(
             "binary_compare $name exact=${firstDiff == null} actual_bytes=${actual.size} expected_bytes=${expected.size} " +
                 "first_diff=${firstDiff ?: -1}"
         )
+        recordFailure("binary:$name", firstDiff == null)
     }
 
     private fun emitDiscreteComparison(name: String, actual: ByteArray, expected: ByteArray) {
@@ -327,6 +335,7 @@ class CleanModuleTests(
             index >= expected.size || actual[index] != expected[index]
         } ?: if (actual.size == expected.size) null else minOf(actual.size, expected.size)
         emit("compare=$name kind=discrete pass=${firstDiff == null} exact=${firstDiff == null} first_diff=${firstDiff ?: -1}")
+        recordFailure("discrete:$name", firstDiff == null)
     }
 
     private fun emitDiscreteComparison(name: String, actual: ShortArray, expected: ShortArray) {
@@ -334,6 +343,22 @@ class CleanModuleTests(
             index >= expected.size || actual[index] != expected[index]
         } ?: if (actual.size == expected.size) null else minOf(actual.size, expected.size)
         emit("compare=$name kind=discrete pass=${firstDiff == null} exact=${firstDiff == null} first_diff=${firstDiff ?: -1}")
+        recordFailure("discrete:$name", firstDiff == null)
+    }
+
+    private fun recordFailure(label: String, passed: Boolean) {
+        if (!passed) precisionFailures += label
+    }
+
+    private fun finishModule(moduleName: String) {
+        val failures = precisionFailures.distinct()
+        val passed = failures.isEmpty()
+        emit(
+            "module_precision_status=${if (passed) "PASS" else "FAIL"} " +
+                "module=$moduleName failures=${failures.size}" +
+                (if (passed) "" else " failed_checks=${failures.joinToString(",")}")
+        )
+        require(passed) { "$moduleName precision failed at ${failures.joinToString(",")}" }
     }
 
     private fun emitMetadata() {

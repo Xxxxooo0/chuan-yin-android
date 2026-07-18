@@ -166,6 +166,18 @@ class ILatentDecoder(nn.Module):
         return self.dec(i_y_hat, self.q_dec)
 
 
+class ILatentConvIn(nn.Module):
+    """First deployable I latent-decoder segment: DCB front plus q_dec."""
+
+    def __init__(self, model, qp: int):
+        super().__init__()
+        self.conv_in = model.dec.conv_in
+        self.register_buffer("q_dec", model.q_scale_dec[qp : qp + 1].detach().clone())
+
+    def forward(self, i_y_hat):
+        return self.conv_in(i_y_hat) * self.q_dec
+
+
 class PLatentDecoder(nn.Module):
     def __init__(self, model, qp: int):
         super().__init__()
@@ -1213,6 +1225,12 @@ class PFastFeatureToFrameProbe(nn.Module):
 
 
 SEGMENTS: dict[str, dict[str, Any]] = {
+    "i_latent_conv_in": {
+        "family": "i",
+        "module": ILatentConvIn,
+        "inputs": [("i_y_hat", (1, 256, 16, 32))],
+        "outputs": [("i_dec_stage0", (1, 512, 16, 32))],
+    },
     "i_latent_decoder": {
         "family": "i",
         "module": ILatentDecoder,
@@ -1926,6 +1944,8 @@ def main() -> None:
         assets_dir = android_root / "app" / "src" / "main" / "assets" / "recon_diagnostic"
         assets_dir.mkdir(parents=True, exist_ok=True)
         for record in asset_records:
+            if "onnx" in record:
+                shutil.copy2(record["onnx"], assets_dir / Path(record["onnx"]).name)
             if "tflite" in record:
                 shutil.copy2(record["tflite"], assets_dir / Path(record["tflite"]).name)
             if "dla" in record:

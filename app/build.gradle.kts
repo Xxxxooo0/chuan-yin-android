@@ -21,6 +21,28 @@ android {
         }
     }
 
+    flavorDimensions += "deployment"
+    productFlavors {
+        create("onnxDemo") {
+            dimension = "deployment"
+            applicationIdSuffix = ".onnxdemo"
+            versionNameSuffix = "-onnx"
+            resValue("string", "app_name", "GVC-RT ONNX")
+            buildConfigField("String", "DEPLOYMENT_PATH", "\"onnx_demo\"")
+        }
+        create("mtkOffline") {
+            dimension = "deployment"
+            applicationIdSuffix = ".mtkoffline"
+            versionNameSuffix = "-mtk-offline"
+            resValue("string", "app_name", "GVC-RT MTK Offline")
+            buildConfigField("String", "DEPLOYMENT_PATH", "\"mtk_offline\"")
+        }
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
     sourceSets {
         getByName("main") {
             if (project.hasProperty("gvcrtSkipAssets")) {
@@ -28,6 +50,12 @@ android {
             } else {
                 assets.srcDirs("src/main/assets")
             }
+        }
+        getByName("onnxDemo") {
+            assets.srcDir("src/onnxDemo/assets")
+        }
+        getByName("mtkOffline") {
+            assets.srcDir("src/mtkOffline/assets")
         }
     }
 

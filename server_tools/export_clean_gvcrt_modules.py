@@ -28,7 +28,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", default=os.environ.get("GVC_RT_SOURCE_ROOT"))
-    parser.add_argument("--output-assets", default=str(PROJECT_ROOT / "app" / "src" / "main" / "assets"))
+    parser.add_argument(
+        "--output-assets",
+        default=str(PROJECT_ROOT / "app" / "src" / "onnxDemo" / "assets"),
+    )
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--qp", type=int, default=0)
@@ -485,6 +488,44 @@ class PRecon(torch.nn.Module):
         return feature, frame
 
 
+class IFusedImageEncoder(torch.nn.Module):
+    def __init__(self, model, qp: int):
+        super().__init__()
+        self.encoder = IEncoderFront(model, qp)
+        self.hyper_enc = IHyperEnc(model)
+        self.hyper_prior = IHyperPrior(model)
+        self.prior = IPrior4x(model)
+        self.recon = IRecon(model, qp)
+
+    def forward(self, input_i_frame):
+        y = self.encoder(input_i_frame)
+        _, z_hat = self.hyper_enc(y)
+        params = self.hyper_prior(z_hat, y)
+        y_q0, y_q1, y_q2, y_q3, s0, s1, s2, s3, y_hat = self.prior(y, params)
+        _, reference_frame = self.recon(y_hat)
+        return z_hat, y_q0, y_q1, y_q2, y_q3, s0, s1, s2, s3, reference_frame
+
+
+class PFusedImageEncoder(torch.nn.Module):
+    def __init__(self, model, qp: int):
+        super().__init__()
+        self.temporal = TemporalFromFrame(model, qp)
+        self.encoder = PEncoderFront(model, qp)
+        self.hyper_enc = PHyperEnc(model)
+        self.hyper_prior = PHyperPrior(model)
+        self.prior = PPrior2x(model)
+        self.recon = PRecon(model, qp)
+
+    def forward(self, input_p_frame, reference_frame):
+        _, ctx, ctx_t = self.temporal(reference_frame)
+        y = self.encoder(input_p_frame, ctx)
+        _, z_hat = self.hyper_enc(y)
+        params = self.hyper_prior(z_hat, ctx_t)
+        y_q0, y_q1, s0, s1, y_hat = self.prior(y, params)
+        _, reconstructed_frame = self.recon(y_hat, ctx)
+        return z_hat, y_q0, y_q1, s0, s1, reconstructed_frame
+
+
 def tensor_spec(path: str, shape: Iterable[int]) -> Dict:
     return {"path": path, "shape": list(shape), "dtype": "float32"}
 
@@ -557,6 +598,8 @@ def main() -> None:
     p_decode_stage_0 = PDecodePriorStage0(p_model).to(device).eval()
     p_decode_stage_1 = PDecodePriorStage1(p_model).to(device).eval()
     p_recon = PRecon(p_model, args.qp).to(device).eval()
+    i_fused_image_encoder = IFusedImageEncoder(i_model, args.qp).to(device).eval()
+    p_fused_image_encoder = PFusedImageEncoder(p_model, args.qp).to(device).eval()
 
     with torch.no_grad():
         i_y = i_encoder(input_i)
@@ -695,6 +738,22 @@ def main() -> None:
     export_onnx(p_decode_stage_0, models_dir / "p_decode_prior_stage_0.onnx", (p_params, p_y_q0), ["p_common_params", "p_y_q_w_0"], ["p_s_w_0", "p_y_hat_so_far_0"], args.opset)
     export_onnx(p_decode_stage_1, models_dir / "p_decode_prior_stage_1.onnx", (p_params, p_decode_y0, p_y_q1), ["p_common_params", "p_y_hat_so_far_0", "p_y_q_w_1"], ["p_s_w_1", "p_y_hat"], args.opset)
     export_onnx(p_recon, models_dir / "p_recon.onnx", (p_y_hat, p_ctx), ["p_y_hat", "p_ctx"], ["encoder_p_reference_feature", "encoder_p_reference_frame"], args.opset)
+    export_onnx(
+        i_fused_image_encoder,
+        models_dir / "i_image_encoder_fused.onnx",
+        (input_i,),
+        ["input_i_frame"],
+        ["i_z_hat", "i_y_q_w_0", "i_y_q_w_1", "i_y_q_w_2", "i_y_q_w_3", "i_s_w_0", "i_s_w_1", "i_s_w_2", "i_s_w_3", "encoder_i_reference_frame"],
+        args.opset,
+    )
+    export_onnx(
+        p_fused_image_encoder,
+        models_dir / "p_image_encoder_fused.onnx",
+        (input_p, i_ref),
+        ["input_p_frame", "encoder_i_reference_frame"],
+        ["p_z_hat", "p_y_q_w_0", "p_y_q_w_1", "p_s_w_0", "p_s_w_1", "encoder_p_reference_frame"],
+        args.opset,
+    )
 
     manifest = build_manifest(source_root, args, i_ckpt, p_ckpt, tensors, entropy_assets, stream)
     manifest["metadata"]["model_sha256"] = {
@@ -911,6 +970,47 @@ def build_manifest(
                         {"android": "outputs/i_rans_payload.bin", "baseline": "baseline/bitstream/i_rans_payload.bin"},
                         {"android": "outputs/p_rans_payload.bin", "baseline": "baseline/bitstream/p_rans_payload.bin"},
                     ],
+                }
+            ],
+            "image_inference_fused": [
+                {
+                    "name": "fused_i_then_p",
+                    "steps": [
+                        graph_step(
+                            "i_image_encoder_fused",
+                            "models/i_image_encoder_fused.onnx",
+                            {"input_i_frame": tensor_spec("baseline/inputs/input_i_frame.f32le", [1, 3, args.height, args.width])},
+                            {
+                                "i_z_hat": out("i_z_hat"),
+                                "i_y_q_w_0": out("i_y_q_w_0"),
+                                "i_y_q_w_1": out("i_y_q_w_1"),
+                                "i_y_q_w_2": out("i_y_q_w_2"),
+                                "i_y_q_w_3": out("i_y_q_w_3"),
+                                "i_s_w_0": out("i_s_w_0"),
+                                "i_s_w_1": out("i_s_w_1"),
+                                "i_s_w_2": out("i_s_w_2"),
+                                "i_s_w_3": out("i_s_w_3"),
+                                "encoder_i_reference_frame": out("encoder_i_reference_frame"),
+                            },
+                        ),
+                        graph_step(
+                            "p_image_encoder_fused",
+                            "models/p_image_encoder_fused.onnx",
+                            {
+                                "input_p_frame": tensor_spec("baseline/inputs/input_p_frame.f32le", [1, 3, args.height, args.width]),
+                                "encoder_i_reference_frame": source_spec("encoder_i_reference_frame"),
+                            },
+                            {
+                                "p_z_hat": out("p_z_hat"),
+                                "p_y_q_w_0": out("p_y_q_w_0"),
+                                "p_y_q_w_1": out("p_y_q_w_1"),
+                                "p_s_w_0": out("p_s_w_0"),
+                                "p_s_w_1": out("p_s_w_1"),
+                                "encoder_p_reference_frame": out("encoder_p_reference_frame"),
+                            },
+                        ),
+                    ],
+                    "binary_comparisons": [],
                 }
             ],
             "complete_decoder": [

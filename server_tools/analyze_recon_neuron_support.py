@@ -220,9 +220,19 @@ def run_ncc(command: list[str], log_path: Path) -> tuple[int, str]:
 
 def interesting_lines(text: str) -> list[str]:
     lines: list[str] = []
+    current_op: str | None = None
     for line in text.splitlines():
+        stripped = line.strip()
+        if re.match(r"^OP\[\d+\]:", stripped):
+            current_op = stripped
+            continue
+        if "Target:" in stripped and stripped not in lines:
+            lines.append(stripped)
         if any(pattern.search(line) for pattern in UNSUPPORTED_PATTERNS):
-            lines.append(line.strip())
+            if current_op and current_op not in lines:
+                lines.append(current_op)
+            if stripped not in lines:
+                lines.append(stripped)
     return lines[:80]
 
 
@@ -270,6 +280,7 @@ def analyze_one(
 
     if compile_dla:
         dla_path = output_dir / "dla" / f"{label}.dla"
+        dla_path.parent.mkdir(parents=True, exist_ok=True)
         dla_log = logs_dir / f"{label}_compile_dla.log"
         dla_cmd = [
             ncc,
@@ -317,7 +328,10 @@ def main() -> None:
     args = parser.parse_args()
 
     android_root = args.android_root.resolve()
-    assets_dir = (args.assets_dir or android_root / "app" / "src" / "main" / "assets" / "recon_diagnostic").resolve()
+    assets_dir = (
+        args.assets_dir
+        or android_root / "app" / "src" / "mtkOffline" / "conversion_inputs" / "recon_diagnostic"
+    ).resolve()
     output_dir = (args.output_dir or android_root / "outputs" / "recon_neuron_diagnostics").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -13,6 +13,7 @@ import java.util.EnumSet
 enum class OnnxBackend(val label: String) {
     CPU("CPU_ORT_ALL_OPT"),
     NNAPI_FP16_ALLOW_FALLBACK("NNAPI_FP16_ALLOW_FALLBACK"),
+    NNAPI_FP16_CPU_DISABLED("NNAPI_FP16_CPU_DISABLED"),
 }
 
 class OnnxSessionRunner(
@@ -57,8 +58,12 @@ class OnnxSessionRunner(
         sessions.getOrPut(step.model) {
             val options = OrtSession.SessionOptions().apply {
                 setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                if (backend == OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK) {
-                    addNnapi(EnumSet.of(NNAPIFlags.USE_FP16))
+                when (backend) {
+                    OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK ->
+                        addNnapi(EnumSet.of(NNAPIFlags.USE_FP16))
+                    OnnxBackend.NNAPI_FP16_CPU_DISABLED ->
+                        addNnapi(EnumSet.of(NNAPIFlags.USE_FP16, NNAPIFlags.CPU_DISABLED))
+                    OnnxBackend.CPU -> Unit
                 }
             }
             env.createSession(store.materialize(step.model).absolutePath, options)

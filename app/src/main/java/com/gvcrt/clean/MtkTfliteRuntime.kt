@@ -38,9 +38,16 @@ class MtkTfliteRuntime private constructor(
             accelerationMode: Int = ACCELERATION_NEURON,
             acceleratorFlag: Int = ACCELERATOR_AUTO,
             cacheDir: File? = null,
+            allowFp16ForFp32: Boolean = true,
         ): MtkTfliteRuntime {
             cacheDir?.mkdirs()
-            val handle = nativeCreate(tfliteFile.absolutePath, accelerationMode, acceleratorFlag, cacheDir?.absolutePath)
+            val handle = nativeCreate(
+                tfliteFile.absolutePath,
+                accelerationMode,
+                acceleratorFlag,
+                cacheDir?.absolutePath,
+                allowFp16ForFp32,
+            )
             return MtkTfliteRuntime(
                 handle = handle,
                 inputSizes = nativeInputSizes(handle),
@@ -100,6 +107,12 @@ class MtkTfliteRuntime private constructor(
 
         fun probeAhwbSymbols(): String =
             nativeProbeAhwbSymbols()
+
+        fun runNeuronAdapterFp16Conv(
+            input: ByteArray,
+            weightsOhwi: ByteArray,
+            bias: ByteArray,
+        ): Array<ByteArray> = nativeNeuronAdapterFp16Conv(input, weightsOhwi, bias)
 
         fun pixelUnshuffle2Nchw256(input: FloatArray): FloatArray =
             nativePixelUnshuffle2Nchw256(input)
@@ -209,7 +222,13 @@ class MtkTfliteRuntime private constructor(
         fun probeDlaRuntime(dlaPath: String): String =
             nativeDlaRuntimeProbe(dlaPath)
 
-        private external fun nativeCreate(path: String, accelerationMode: Int, acceleratorFlag: Int, cacheDir: String?): Long
+        private external fun nativeCreate(
+            path: String,
+            accelerationMode: Int,
+            acceleratorFlag: Int,
+            cacheDir: String?,
+            allowFp16ForFp32: Boolean,
+        ): Long
         private external fun nativeRelease(handle: Long)
         private external fun nativeInputSizes(handle: Long): LongArray
         private external fun nativeOutputSizes(handle: Long): LongArray
@@ -250,6 +269,11 @@ class MtkTfliteRuntime private constructor(
         ): LongArray
         private external fun nativeProbeNeuronExtensions(names: Array<String>): String
         private external fun nativeProbeAhwbSymbols(): String
+        private external fun nativeNeuronAdapterFp16Conv(
+            input: ByteArray,
+            weightsOhwi: ByteArray,
+            bias: ByteArray,
+        ): Array<ByteArray>
         private external fun nativePixelUnshuffle2Nchw256(input: FloatArray): FloatArray
         private external fun nativeGroupNormNchw(
             input: FloatArray,

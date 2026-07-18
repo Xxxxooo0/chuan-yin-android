@@ -2307,7 +2307,8 @@ Java_com_gvcrt_clean_MtkTfliteRuntime_00024Companion_nativeFusedPixelUnshuffleAd
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_gvcrt_clean_MtkTfliteRuntime_00024Companion_nativeCreate(
-    JNIEnv* env, jclass, jstring path, jint accelerationMode, jint acceleratorFlag, jstring cacheDir) {
+    JNIEnv* env, jclass, jstring path, jint accelerationMode, jint acceleratorFlag, jstring cacheDir,
+    jboolean allowFp16ForFp32) {
     try {
         const char* chars = env->GetStringUTFChars(path, nullptr);
         std::string modelPath(chars);
@@ -2332,7 +2333,7 @@ Java_com_gvcrt_clean_MtkTfliteRuntime_00024Companion_nativeCreate(
         appendOptionStatus(
             optionStatuses,
             "allowFp16",
-            runtime->api->optionsSetAllowFp16(options, true));
+            runtime->api->optionsSetAllowFp16(options, allowFp16ForFp32 == JNI_TRUE));
         applyOptionalOption(optionStatuses, "preferenceSustainedSpeed", runtime->api->optionsSetPreference, options, 2);
         applyOptionalOption(optionStatuses, "priorityHigh", runtime->api->optionsSetExecutionPriority, options, 110);
         applyOptionalOption(optionStatuses, "lowLatency", runtime->api->optionsSetLowLatency, options, true);

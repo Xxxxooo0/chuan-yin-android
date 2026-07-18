@@ -59,6 +59,24 @@ object TensorIO {
         return bytes
     }
 
+    fun readF16Le(name: String, shape: LongArray, bytes: ByteArray): TensorValue {
+        val expectedBytes = shape.fold(1L) { acc, value -> acc * value } * 2L
+        require(bytes.size.toLong() == expectedBytes) {
+            "$name byte size mismatch: got=${bytes.size}, expected=$expectedBytes"
+        }
+        val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        val data = FloatArray((expectedBytes / 2L).toInt())
+        for (index in data.indices) data[index] = halfBitsToFloat(bb.short)
+        return TensorValue(name, shape, data)
+    }
+
+    fun f16Le(tensor: TensorValue): ByteArray {
+        val bytes = ByteArray(tensor.data.size * 2)
+        val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        tensor.data.forEach { value -> bb.putShort(floatToHalfBits(value)) }
+        return bytes
+    }
+
     fun diff(a: TensorValue, b: TensorValue): TensorDiff {
         require(a.data.size == b.data.size) {
             "${a.name}/${b.name} element mismatch: ${a.data.size} vs ${b.data.size}"

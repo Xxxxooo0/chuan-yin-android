@@ -91,6 +91,21 @@ class ReconDiagnosticBenchmark(
             emit("recon_diag_complete")
             return
         }
+        if (labelFilter == I_LATENT_CONV_IN_PRECISION_LABEL) {
+            runILatentConvInPrecisionProbe()
+            emit("recon_diag_complete")
+            return
+        }
+        if (labelFilter == I_LATENT_CONV_IN_NHWC_PRECISION_LABEL) {
+            runILatentConvInNhwcPrecisionProbe()
+            emit("recon_diag_complete")
+            return
+        }
+        if (labelFilter == I_LATENT_CONV_IN_NHWC_CPU_PRECISION_LABEL) {
+            runILatentConvInNhwcCpuPrecisionProbe()
+            emit("recon_diag_complete")
+            return
+        }
         if (labelFilter == NATIVE_P_RECON_PIPELINE_STAGE3_FP16_LABEL) {
             runNativePReconPipelineProbe(
                 label = NATIVE_P_RECON_PIPELINE_STAGE3_FP16_LABEL,
@@ -1060,6 +1075,156 @@ class ReconDiagnosticBenchmark(
         emit("recon_stage_precision_first_failed=${firstFailed ?: "none_in_first_stage"}")
     }
 
+    private fun runILatentConvInPrecisionProbe() {
+        val tfliteAsset = "recon_diagnostic/i_latent_conv_in_fp32.tflite"
+        val onnxAsset = "recon_diagnostic/i_latent_conv_in.onnx"
+        val inputAsset = "baseline/tensors/i_y_hat.f32le"
+        val missing = listOf(tfliteAsset, onnxAsset, inputAsset).filterNot(store::exists)
+        if (missing.isNotEmpty()) {
+            emit(
+                "recon_precision_skip label=$I_LATENT_CONV_IN_PRECISION_LABEL " +
+                    "reason=missing_assets assets=${missing.joinToString(":")}",
+            )
+            return
+        }
+
+        val yHat = TensorIO.readF32Le("i_y_hat", I_LATENT_INPUT_SHAPE, store.readBytes(inputAsset))
+        val step = GraphStep(
+            name = "i_latent_conv_in_cpu_reference",
+            model = onnxAsset,
+            inputs = listOf(InputSpec("i_y_hat", source = null, path = null, shape = I_LATENT_INPUT_SHAPE)),
+            outputs = listOf(OutputSpec("i_dec_stage0", I_LATENT_OUTPUT_SHAPE, baseline = null)),
+        )
+        emit(
+            "recon_precision_start label=$I_LATENT_CONV_IN_PRECISION_LABEL " +
+                "reference=onnx_cpu candidate=mtk_neuron_fp32 input=i_y_hat",
+        )
+        emit(
+            "recon_precision_assets onnx_sha256=${store.sha256(onnxAsset)} " +
+                "tflite_sha256=${store.sha256(tfliteAsset)} input_sha256=${store.sha256(inputAsset)}",
+        )
+
+        val onnxOutput = OnnxSessionRunner(store, OnnxBackend.CPU).use { runner ->
+            runner.run(step, mapOf(yHat.name to yHat)).getValue("i_dec_stage0")
+        }
+        val tfliteOutputs = linkedMapOf<String, TensorValue>()
+        for ((backend, mode) in listOf(
+            "mtk_cpu" to MtkTfliteRuntime.ACCELERATION_CPU,
+            "mtk_neuron" to MtkTfliteRuntime.ACCELERATION_NEURON,
+        )) {
+            tfliteOutputs[backend] = MtkTfliteRuntime.create(
+                store.materialize(tfliteAsset),
+                accelerationMode = mode,
+                cacheDir = cacheDir,
+                allowFp16ForFp32 = false,
+            ).use { runtime ->
+                emit(
+                    "recon_precision_mtk backend=$backend fully_delegated=${runtime.fullyDelegated} " +
+                        "options=${runtime.optionsSummary}",
+                )
+                val bytes = runtime.run(listOf(TensorIO.f32Le(yHat))).single()
+                TensorIO.readF32Le("i_dec_stage0_$backend", I_LATENT_OUTPUT_SHAPE, bytes)
+            }
+        }
+        emitLatentConvInDiff("i_latent_conv_in_mtk_cpu_vs_onnx_cpu", tfliteOutputs.getValue("mtk_cpu"), onnxOutput)
+        emitLatentConvInDiff("i_latent_conv_in_mtk_neuron_vs_onnx_cpu", tfliteOutputs.getValue("mtk_neuron"), onnxOutput)
+        emitLatentConvInDiff("i_latent_conv_in_mtk_neuron_vs_mtk_cpu", tfliteOutputs.getValue("mtk_neuron"), tfliteOutputs.getValue("mtk_cpu"))
+    }
+
+    private fun emitLatentConvInDiff(name: String, actual: TensorValue, expected: TensorValue) {
+        val diff = TensorIO.diff(actual, expected)
+        emit(
+            "recon_precision compare=$name pass=${diff.maxAbs <= I_LATENT_CONTINUOUS_TOLERANCE} " +
+                "threshold=$I_LATENT_CONTINUOUS_TOLERANCE " +
+                "max_abs=${fmtFloat(diff.maxAbs.toDouble())} " +
+                "mean_abs=${fmtFloat(diff.meanAbs.toDouble())} " +
+                "rmse=${fmtFloat(diff.rmse.toDouble())} exact=${diff.exact}",
+        )
+    }
+
+    private fun runILatentConvInNhwcPrecisionProbe() {
+        runILatentConvInNhwcPrecision(
+            label = I_LATENT_CONV_IN_NHWC_PRECISION_LABEL,
+            backends = listOf(
+                "mtk_cpu" to MtkTfliteRuntime.ACCELERATION_CPU,
+                "mtk_neuron" to MtkTfliteRuntime.ACCELERATION_NEURON,
+            ),
+        )
+    }
+
+    private fun runILatentConvInNhwcCpuPrecisionProbe() {
+        runILatentConvInNhwcPrecision(
+            label = I_LATENT_CONV_IN_NHWC_CPU_PRECISION_LABEL,
+            backends = listOf("mtk_cpu" to MtkTfliteRuntime.ACCELERATION_CPU),
+        )
+    }
+
+    private fun runILatentConvInNhwcPrecision(
+        label: String,
+        backends: List<Pair<String, Int>>,
+    ) {
+        val tfliteAsset = "recon_diagnostic/i_latent_conv_in_nhwc_fp32.tflite"
+        val onnxAsset = "recon_diagnostic/i_latent_conv_in.onnx"
+        val inputAsset = "baseline/tensors/i_y_hat.f32le"
+        val missing = listOf(tfliteAsset, onnxAsset, inputAsset).filterNot(store::exists)
+        if (missing.isNotEmpty()) {
+            emit(
+                "recon_precision_skip label=$label " +
+                    "reason=missing_assets assets=${missing.joinToString(":")}",
+            )
+            return
+        }
+
+        val yHat = TensorIO.readF32Le("i_y_hat", I_LATENT_INPUT_SHAPE, store.readBytes(inputAsset))
+        val onnxStep = GraphStep(
+            name = "i_latent_conv_in_cpu_reference",
+            model = onnxAsset,
+            inputs = listOf(InputSpec("i_y_hat", source = null, path = null, shape = I_LATENT_INPUT_SHAPE)),
+            outputs = listOf(OutputSpec("i_dec_stage0", I_LATENT_OUTPUT_SHAPE, baseline = null)),
+        )
+        val onnxOutput = OnnxSessionRunner(store, OnnxBackend.CPU).use { runner ->
+            runner.run(onnxStep, mapOf(yHat.name to yHat)).getValue("i_dec_stage0")
+        }
+        val inputNhwc = PriorNpuTensorCodec.nchwToNhwcF32(yHat.data, 256, 16, 32)
+        emit(
+            "recon_precision_start label=$label " +
+                "reference=onnx_cpu candidate=mtk_tflite_nhwc input_shape=1,16,32,256 output_shape=1,16,32,512",
+        )
+        emit(
+            "recon_precision_assets onnx_sha256=${store.sha256(onnxAsset)} " +
+                "tflite_sha256=${store.sha256(tfliteAsset)} input_sha256=${store.sha256(inputAsset)}",
+        )
+        val outputs = linkedMapOf<String, TensorValue>()
+        for ((backend, mode) in backends) {
+            outputs[backend] = MtkTfliteRuntime.create(
+                store.materialize(tfliteAsset),
+                accelerationMode = mode,
+                cacheDir = cacheDir,
+                allowFp16ForFp32 = false,
+            ).use { runtime ->
+                emit(
+                    "recon_precision_mtk backend=$backend fully_delegated=${runtime.fullyDelegated} " +
+                        "options=${runtime.optionsSummary}",
+                )
+                val bytes = runtime.run(listOf(inputNhwc)).single()
+                TensorValue(
+                    "i_dec_stage0_${backend}_nhwc",
+                    I_LATENT_OUTPUT_SHAPE,
+                    PriorNpuTensorCodec.nhwcF32ToNchw(bytes, 512, 16, 32),
+                )
+            }
+        }
+        outputs["mtk_cpu"]?.let {
+            emitLatentConvInDiff("i_latent_conv_in_nhwc_mtk_cpu_vs_onnx_cpu", it, onnxOutput)
+        }
+        outputs["mtk_neuron"]?.let {
+            emitLatentConvInDiff("i_latent_conv_in_nhwc_mtk_neuron_vs_onnx_cpu", it, onnxOutput)
+            outputs["mtk_cpu"]?.let { cpuOutput ->
+                emitLatentConvInDiff("i_latent_conv_in_nhwc_mtk_neuron_vs_mtk_cpu", it, cpuOutput)
+            }
+        }
+    }
+
     private fun emitTensorDiff(name: String, actual: TensorValue, expected: TensorValue) {
         val diff = TensorIO.diff(actual, expected)
         emit(
@@ -1266,6 +1431,12 @@ class ReconDiagnosticBenchmark(
         private const val NATIVE_P_RECON_PIPELINE_PROBE_LABEL = "native_p_recon_pipeline_probe"
         private const val NATIVE_P_RECON_PRECISION_PROBE_LABEL = "native_p_recon_precision_probe"
         private const val NATIVE_P_RECON_STAGE_PRECISION_PROBE_LABEL = "native_p_recon_stage_precision_probe"
+        private const val I_LATENT_CONV_IN_PRECISION_LABEL = "i_latent_conv_in_precision"
+        private const val I_LATENT_CONV_IN_NHWC_PRECISION_LABEL = "i_latent_conv_in_nhwc_precision"
+        private const val I_LATENT_CONV_IN_NHWC_CPU_PRECISION_LABEL = "i_latent_conv_in_nhwc_cpu_precision"
+        private val I_LATENT_INPUT_SHAPE = longArrayOf(1, 256, 16, 32)
+        private val I_LATENT_OUTPUT_SHAPE = longArrayOf(1, 512, 16, 32)
+        private const val I_LATENT_CONTINUOUS_TOLERANCE = 5e-4f
         private const val NATIVE_P_RECON_PIPELINE_STAGE3_FP16_LABEL = "native_p_recon_pipeline_stage3_fp16_probe"
         private const val NATIVE_P_RECON_PIPELINE_STAGE4_FP16_LABEL = "native_p_recon_pipeline_stage4_fp16_probe"
         private const val NATIVE_P_RECON_PIPELINE_HOTSPOT_FP16_LABEL = "native_p_recon_pipeline_hotspot_fp16_probe"
@@ -1425,6 +1596,7 @@ class ReconDiagnosticBenchmark(
         private val DEFAULT_VARIANTS = listOf("fp32")
         private val ALL_VARIANTS = listOf("fp32", "fp16_weight", "fp16")
         private val MODELS = listOf(
+            ModelSpec("i_latent_conv_in", listOf(TensorSpec("i_y_hat", longArrayOf(1, 256, 16, 32)))),
             ModelSpec("i_recon_full", listOf(TensorSpec("i_y_hat", longArrayOf(1, 256, 16, 32)))),
             ModelSpec(
                 "p_recon_full",
