@@ -331,7 +331,7 @@ class MainActivity : Activity() {
                             }
                             imageRunnerFor(backend, ::emit).run(
                                 intent.getStringExtra("imagePath"),
-                                decodeFromBitstream = intent.getBooleanExtra("imageInferenceDecodeBitstream", false),
+                                decodeFromBitstream = intent.getBooleanExtra("imageInferenceDecodeBitstream", true),
                             )
                         }
                         moduleName == "recon_diagnostic" -> {
@@ -483,6 +483,12 @@ class MainActivity : Activity() {
             }
             line.startsWith("image_speed stage=core_codec") -> {
                 imageSummaryLines["Inference"] = "Core codec: ${line.valueAfter("ms")} ms"
+            }
+            line.startsWith("image_speed stage=encode_core") -> {
+                imageSummaryLines["Encode"] = "Encode core: ${line.valueAfter("ms")} ms"
+            }
+            line.startsWith("image_speed stage=decode_core") -> {
+                imageSummaryLines["Decode"] = "Decode core: ${line.valueAfter("ms")} ms"
             }
         }
         if (imageSummaryLines.isNotEmpty()) {

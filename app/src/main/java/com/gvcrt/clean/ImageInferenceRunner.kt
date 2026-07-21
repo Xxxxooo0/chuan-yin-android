@@ -25,7 +25,7 @@ class ImageInferenceRunner(
         }
     }
 
-    fun run(imagePath: String?, decodeFromBitstream: Boolean = false) {
+    fun run(imagePath: String?, decodeFromBitstream: Boolean = true) {
         val image = ImageTensorLoader.load(context, imagePath)
         emit(
             "image_inference_source=${image.source} original=${image.originalWidth}x${image.originalHeight} " +
@@ -43,6 +43,8 @@ class ImageInferenceRunner(
         val timer = StageTimer()
         var totalNs = 0L
         var coreCodecNs = 0L
+        var encodeCoreNs = 0L
+        var decodeCoreNs = 0L
         val iEncoderRans = createRansEncoder(iEntropy)
         val pEncoderRans = createRansEncoder(pEntropy)
         val iRans = if (decodeFromBitstream) createRans(iEntropy) else null
@@ -67,6 +69,7 @@ class ImageInferenceRunner(
             val pPayload = encodeEntropy("p", pEntropy, tensors, 2, pEncoderRans, timer)
             memory.mark("encode_complete")
             val bitstream = timer.measure("stream_mux") { GvcStreamMuxer.mux(stream, iPayload, pPayload) }
+            encodeCoreNs = SystemClock.elapsedRealtimeNanos() - codecStarted
             store.writeOutput("outputs/image_inference_encoded_ip.gvc", bitstream)
             emit(
                 "image_bitstream path=outputs/image_inference_encoded_ip.gvc bytes=${bitstream.size} " +
@@ -75,6 +78,7 @@ class ImageInferenceRunner(
 
             val reconstructed = if (decodeFromBitstream) {
                 emit("image_reconstruction_source=decoded_bitstream")
+                val decodeStarted = SystemClock.elapsedRealtimeNanos()
                 decodeBitstream(
                     bitstream,
                     decoder,
@@ -85,13 +89,27 @@ class ImageInferenceRunner(
                     pRans ?: error("missing P rANS decoder"),
                     runner,
                     timer,
-                )
+                ).also {
+                    decodeCoreNs = SystemClock.elapsedRealtimeNanos() - decodeStarted
+                }
             } else {
                 emit("image_reconstruction_source=encoder_local_reference")
                 tensors
             }
             coreCodecNs = SystemClock.elapsedRealtimeNanos() - codecStarted
             memory.mark("reconstruction_complete")
+            if (decodeFromBitstream) {
+                emitRoundTripComparison(
+                    "i_reference_frame",
+                    tensors.getValue("encoder_i_reference_frame"),
+                    reconstructed.getValue("encoder_i_reference_frame"),
+                )
+                emitRoundTripComparison(
+                    "p_reference_frame",
+                    tensors.getValue("encoder_p_reference_frame"),
+                    reconstructed.getValue("encoder_p_reference_frame"),
+                )
+            }
             timer.measure("quality_metrics") {
                 emitQuality("i_recon_vs_input", inputI, reconstructed.getValue("encoder_i_reference_frame"))
             }
@@ -119,6 +137,8 @@ class ImageInferenceRunner(
 
         emit("image_speed stage=total ms=${formatMs(totalNs)}")
         emit("image_speed stage=core_codec ms=${formatMs(coreCodecNs)}")
+        emit("image_speed stage=encode_core ms=${formatMs(encodeCoreNs)}")
+        emit("image_speed stage=decode_core ms=${formatMs(decodeCoreNs)}")
         timer.values.forEach { (stage, elapsedNs) ->
             emit("image_speed stage=$stage ms=${formatMs(elapsedNs)}")
         }
@@ -140,7 +160,7 @@ class ImageInferenceRunner(
         runner: OnnxSessionRunner,
         timer: StageTimer,
     ): Map<String, TensorValue> {
-        val parsed = timer.measure("stream_parse") { GvcStreamMuxer.demux(bitstream) }
+        val parsed = timer.measure("decode_stream_parse") { GvcStreamMuxer.demux(bitstream) }
         require(parsed.stream.height == expectedStream.height && parsed.stream.width == expectedStream.width) {
             "decoded stream geometry differs from manifest"
         }
@@ -166,7 +186,7 @@ class ImageInferenceRunner(
         timer: StageTimer,
     ) {
         val zName = "${prefix}_z_hat"
-        val zBytes = timer.measure("${prefix}_rans_z") {
+        val zBytes = timer.measure("decode_${prefix}_rans_z") {
             rans.beginDecode(payload)
             rans.decodeZ(decoder.zShape.elementCount(), entropy.zStartOffset, entropy.zPerChannelSize)
         }
@@ -294,6 +314,14 @@ class ImageInferenceRunner(
                 "rmse=${formatFloat(rmse)} psnr_db=${formatFloat(psnr)}"
         )
         return psnr
+    }
+
+    private fun emitRoundTripComparison(label: String, encoded: TensorValue, decoded: TensorValue) {
+        val diff = TensorIO.diff(encoded, decoded)
+        emit(
+            "image_roundtrip $label exact=${diff.exact} max_abs=${formatFloat(diff.maxAbs.toDouble())} " +
+                "mean_abs=${formatFloat(diff.meanAbs.toDouble())} rmse=${formatFloat(diff.rmse.toDouble())}"
+        )
     }
 
     private fun writeTensorPng(tensor: TensorValue, fileName: String): File {
