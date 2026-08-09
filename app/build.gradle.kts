@@ -55,7 +55,11 @@ android {
             assets.srcDir("src/onnxDemo/assets")
         }
         getByName("mtkOffline") {
-            assets.srcDir("src/mtkOffline/assets")
+            if (project.hasProperty("gvcrtSkipAssets")) {
+                assets.setSrcDirs(emptyList<String>())
+            } else {
+                assets.srcDir("src/mtkOffline/assets")
+            }
         }
     }
 

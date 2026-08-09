@@ -224,6 +224,7 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("iPriorNpuSpeedTest", false) -> listOf("i_prior_npu_speed")
             intent.getBooleanExtra("iPriorTfliteProbe", false) -> listOf("i_prior_tflite_probe")
             intent.getBooleanExtra("pPriorTfliteProbe", false) -> listOf("p_prior_tflite_probe")
+            intent.getBooleanExtra("enterpriseTfliteTest", false) -> listOf("enterprise_tflite")
             else -> emptyList()
         }
         return if (BuildConfig.DEPLOYMENT_PATH != "onnx_demo" || requested.all(ONNX_DEMO_MODULES::contains)) {
@@ -410,6 +411,14 @@ class MainActivity : Activity() {
                         }
                         moduleName == "p_prior_tflite_probe" -> {
                             PEncoderPriorTfliteDiagnostic(this, ::emit).run()
+                        }
+                        moduleName == "enterprise_tflite" -> {
+                            EnterpriseTfliteCompatibilityProbe(this, ::emit).run(
+                                variant = intent.getStringExtra("enterpriseTfliteVariant") ?: "all",
+                                warmupRuns = intent.getIntExtra("enterpriseTfliteWarmup", 3),
+                                measuredRuns = intent.getIntExtra("enterpriseTfliteMeasured", 10),
+                                relaxFp32 = intent.getBooleanExtra("enterpriseTfliteRelaxFp32", false),
+                            )
                         }
                         moduleName.endsWith("_speed") -> {
                             ModuleSpeedBenchmarks(

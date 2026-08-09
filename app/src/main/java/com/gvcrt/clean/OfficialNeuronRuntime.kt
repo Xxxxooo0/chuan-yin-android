@@ -49,11 +49,22 @@ class OfficialNeuronRuntime private constructor(
             tfliteFile: File,
             cacheDir: File,
             allowFp16ForFp32: Boolean = true,
+            acceleratorName: String? = null,
+            compileOptions: String? = null,
+            executionPreference: Int = NeuronDelegate.Options.EXECUTION_PREFERENCE_SUSTAINED_SPEED,
+            modelToken: String? = null,
         ): OfficialNeuronRuntime {
             cacheDir.mkdirs()
             val delegateOptions = NeuronDelegate.Options()
                 .setAllowFp16(allowFp16ForFp32)
-                .setExecutionPreference(NeuronDelegate.Options.EXECUTION_PREFERENCE_SUSTAINED_SPEED)
+                .setExecutionPreference(executionPreference)
+            acceleratorName?.let(delegateOptions::setAcceleratorName)
+            compileOptions?.let(delegateOptions::setCompileOptions)
+            modelToken?.let {
+                delegateOptions
+                    .setCacheDir(cacheDir.absolutePath)
+                    .setModelToken(it)
+            }
             val delegate = NeuronDelegate(delegateOptions)
             val options = Interpreter.Options().addDelegate(delegate)
             val interpreter = try {
@@ -71,7 +82,14 @@ class OfficialNeuronRuntime private constructor(
                 outputSizes = LongArray(interpreter.outputTensorCount) { index ->
                     interpreter.getOutputTensor(index).numBytes().toLong()
                 },
-                optionsSummary = "NeuronDelegate(allowFp16=$allowFp16ForFp32,sustainedSpeed)",
+                optionsSummary = buildString {
+                    append("NeuronDelegate(allowFp16=$allowFp16ForFp32")
+                    append(",preference=$executionPreference")
+                    acceleratorName?.let { append(",accelerator=$it") }
+                    compileOptions?.let { append(",compileOptions=$it") }
+                    modelToken?.let { append(",cache=true,token=$it") }
+                    append(")")
+                },
             )
         }
 
