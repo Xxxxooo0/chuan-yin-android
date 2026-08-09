@@ -1,6 +1,6 @@
 # GVC-RT Small Local Model Snapshot
 
-This directory is committed only on the local `codex/local-model-artifacts`
+This directory is committed only on the local `GVC-RT-S-models`
 branch. Do not push this branch to Gitee.
 
 - `gvc-rt-small_tflite_codec_270p_qp0_with_inputs.tar.gz`: three TFLite models and fixed test inputs.
