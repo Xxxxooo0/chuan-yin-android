@@ -37,6 +37,8 @@ Installs the APK on a connected Android device.
 
 Use Kotlin for app orchestration and C++17 for JNI/native kernels. Keep changes scoped to the active module. Kotlin classes use `PascalCase`; functions and variables use `camelCase`; benchmark labels should be stable snake-like strings, for example `native_p_recon_stage_precision_probe`. Prefer explicit tensor shapes and asset paths in logs.
 
+All `README.md` files in this repository must be written in Chinese. Commands, paths, API names, and identifiers may remain in their original form.
+
 ## Testing Guidelines
 
 This workstation is edit/build only for model inference. Do not run local PyTorch, ONNX Runtime, TFLite, precision, or performance inference tests on the PC. Use:
