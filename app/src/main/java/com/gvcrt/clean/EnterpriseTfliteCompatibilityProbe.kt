@@ -108,6 +108,15 @@ class EnterpriseTfliteCompatibilityProbe(
                     measuredRuns = measuredRuns,
                 )
             }
+            if (variant == "large" && failedModels.isEmpty() && failedStages == 0) {
+                runLargeFixtureBenchmark(
+                    packageRoot = packageRoot,
+                    stages = stages,
+                    runtimes = runtimes,
+                    warmupRuns = warmupRuns,
+                    measuredRuns = measuredRuns,
+                )
+            }
         } finally {
             runtimes.values.forEach(OfficialNeuronRuntime::close)
         }
@@ -207,12 +216,57 @@ class EnterpriseTfliteCompatibilityProbe(
                 totalTimes += totalMs
             }
         }
-        emitSpeed("temporal_reference", temporalTimes)
-        emitSpeed("encoder", encoderTimes)
-        emitSpeed("decoder", decoderTimes)
-        emitSpeed("total", totalTimes)
+        emitSpeed("small", "temporal_reference", temporalTimes)
+        emitSpeed("small", "encoder", encoderTimes)
+        emitSpeed("small", "decoder", decoderTimes)
+        emitSpeed("small", "total", totalTimes)
         emit(
             "enterprise_tflite_speed_complete variant=small mean_fps=${format(1000.0 / totalTimes.average())}",
+        )
+    }
+
+    private fun runLargeFixtureBenchmark(
+        packageRoot: File,
+        stages: List<JSONObject>,
+        runtimes: Map<String, OfficialNeuronRuntime>,
+        warmupRuns: Int,
+        measuredRuns: Int,
+    ) {
+        val fixtureInputs = stages.associateWith { stage ->
+            val inputs = stage.getJSONArray("inputs")
+            (0 until inputs.length()).map { index ->
+                val input = inputs.getJSONObject(index)
+                packageRoot.resolve(input.getString("file")).readBytes()
+            }
+        }
+        val stageTimes = stages.associateWith { mutableListOf<Double>() }
+        val totalTimes = mutableListOf<Double>()
+
+        emit(
+            "enterprise_tflite_speed_start variant=large mode=fixed_fixture_sequence " +
+                "warmup=$warmupRuns measured=$measuredRuns " +
+                "note=entropy_boundary_excluded",
+        )
+        repeat(warmupRuns + measuredRuns) { runIndex ->
+            val totalStarted = SystemClock.elapsedRealtimeNanos()
+            stages.forEach { stage ->
+                val started = SystemClock.elapsedRealtimeNanos()
+                runtimes.getValue(stage.getString("model")).run(fixtureInputs.getValue(stage))
+                if (runIndex >= warmupRuns) {
+                    stageTimes.getValue(stage) += elapsedMs(started)
+                }
+            }
+            if (runIndex >= warmupRuns) {
+                totalTimes += elapsedMs(totalStarted)
+            }
+        }
+        stages.forEach { stage ->
+            emitSpeed("large", stage.getString("id"), stageTimes.getValue(stage))
+        }
+        emitSpeed("large", "fixed_fixture_total", totalTimes)
+        emit(
+            "enterprise_tflite_speed_complete variant=large mode=fixed_fixture_sequence " +
+                "mean_fps=${format(1000.0 / totalTimes.average())}",
         )
     }
 
@@ -224,14 +278,14 @@ class EnterpriseTfliteCompatibilityProbe(
         return packageRoot.resolve(record.getString("file")).readBytes()
     }
 
-    private fun emitSpeed(label: String, values: List<Double>) {
+    private fun emitSpeed(variant: String, label: String, values: List<Double>) {
         val sorted = values.sorted()
         fun percentile(fraction: Double): Double {
             val index = ((sorted.size - 1) * fraction).toInt().coerceIn(sorted.indices)
             return sorted[index]
         }
         emit(
-            "enterprise_tflite_speed variant=small stage=$label samples=${values.size} " +
+            "enterprise_tflite_speed variant=$variant stage=$label samples=${values.size} " +
                 "mean_ms=${format(values.average())} p50_ms=${format(percentile(0.50))} " +
                 "p90_ms=${format(percentile(0.90))}",
         )

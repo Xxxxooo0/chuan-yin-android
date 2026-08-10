@@ -45,6 +45,15 @@ echo "[offline-export] I/P decoder segments"
   --targets i_segments,p_segments \
   --copy-offline-assets
 
+echo "[offline-export] merged I/P decoder synthesis"
+"${PYTHON}" -u server_tools/export_decoder_full_norm_rewrite_nhwc.py \
+  --source-root "${SOURCE_ROOT}" \
+  --android-root "${ANDROID_ROOT}" \
+  --output-dir "${ANDROID_ROOT}/outputs/mtk_offline_decoder_merged" \
+  --ncc-tflite "${NCC}" \
+  --targets i,p \
+  --copy-merged-assets
+
 echo "[offline-export] published assets"
 find "${ANDROID_ROOT}/app/src/mtkOffline/assets/offline_models" \
   -maxdepth 1 -type f \( -name '*.dla' -o -name '*manifest.json' \) \

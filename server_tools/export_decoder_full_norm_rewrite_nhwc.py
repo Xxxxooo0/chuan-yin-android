@@ -13,17 +13,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from analyze_recon_neuron_support import analyze_one, find_ncc
-from export_recon_diagnostic import PROJECT_ROOT, find_tool, load_i_model, load_p_model, sha256
+from export_recon_diagnostic import (
+    PROJECT_ROOT,
+    ExplicitDepthConvBlock,
+    find_tool,
+    load_i_model,
+    load_p_model,
+    sha256,
+)
+
+
+def standard_silu_no_fusion(value: torch.Tensor) -> torch.Tensor:
+    """Keep source x * sigmoid(x) as standard TFLite ops, not MTKEXT_SILU."""
+
+    return value * (torch.sigmoid(value) + (value - value))
 
 
 class FixedGroupNorm(nn.Module):
@@ -118,7 +133,11 @@ class FixedAdaGN(nn.Module):
 class FixedStageBlock(nn.Module):
     def __init__(self, source: nn.Module, height: int, width: int) -> None:
         super().__init__()
-        self.blocks = source.blocks
+        # Source DepthConvBlock is lowered by the converter to MTKEXT_SILU.
+        # Keep the exact weights but expose its SiLU/chunk-add math as standard ops.
+        self.blocks = nn.ModuleList(
+            ExplicitDepthConvBlock(block) for block in source.blocks
+        )
         self.norms = nn.ModuleList(
             FixedGroupNorm(norm, height, width) for norm in source.norms
         )
@@ -196,22 +215,22 @@ class FixedIFeatureDec(nn.Module):
     def __init__(self, model: nn.Module, qp: int) -> None:
         super().__init__()
         source = model.dec
-        self.conv_in = source.conv_in
+        self.conv_in = ExplicitDepthConvBlock(source.conv_in)
         rewritten = []
         for module in source.dec_1:
             if isinstance(module, nn.GroupNorm):
                 rewritten.append(FixedGroupNorm(module, 16, 32))
             else:
-                rewritten.append(module)
+                rewritten.append(ExplicitDepthConvBlock(module))
         self.body = nn.ModuleList(rewritten)
-        self.conv_out = source.conv_out
+        self.conv_out = ExplicitDepthConvBlock(source.conv_out)
         self.register_buffer("q_dec", model.q_scale_dec[qp : qp + 1].detach().clone())
 
     def forward(self, y_hat: torch.Tensor) -> torch.Tensor:
         value = self.conv_in(y_hat) * self.q_dec
         for module in self.body:
             value = module(value)
-        value = value * torch.sigmoid(value)
+        value = standard_silu_no_fusion(value)
         return torch.clamp(self.conv_out(value), -1.0, 1.0)
 
 
@@ -227,30 +246,70 @@ class IFullSynthesisNhwc(nn.Module):
         return frame.permute(0, 2, 3, 1).contiguous()
 
 
-class PFullSynthesisNhwc(nn.Module):
+class ISourceFullSynthesisNhwc(nn.Module):
+    """Unmodified source path used only as the server precision authority."""
+
     def __init__(self, model: nn.Module, qp: int) -> None:
         super().__init__()
         self.feature_dec = model.dec
+        self.generator = model.recon_generation_net
+        self.register_buffer("q_dec", model.q_scale_dec[qp : qp + 1].detach().clone())
+        self.register_buffer("q_recon", model.q_scale_recon[qp : qp + 1].detach().clone())
+
+    def forward(self, y_hat_nhwc: torch.Tensor) -> torch.Tensor:
+        y_hat = y_hat_nhwc.permute(0, 3, 1, 2).contiguous()
+        codeword = self.feature_dec(y_hat, self.q_dec)
+        frame = self.generator(codeword, self.q_recon)
+        return frame.permute(0, 2, 3, 1).contiguous()
+
+
+class PFullSynthesisNhwc(nn.Module):
+    def __init__(self, model: nn.Module, qp: int) -> None:
+        super().__init__()
+        self.feature_dec = FixedPFeatureDec(model, qp)
         self.pixel_unshuffle = FixedPixelUnshuffle2()
         mlp = model.recon_generation_net.mlp
         self.mlp_norm0 = FixedGroupNorm(mlp[0], 16, 32)
-        self.mlp_block0 = mlp[1]
+        self.mlp_block0 = ExplicitDepthConvBlock(mlp[1])
         self.mlp_norm1 = FixedGroupNorm(mlp[2], 16, 32)
-        self.mlp_block1 = mlp[3]
+        self.mlp_block1 = ExplicitDepthConvBlock(mlp[3])
         self.generator = FixedGenerator(model, qp)
-        self.register_buffer("q_dec", model.q_scale_dec[qp : qp + 1].detach().clone())
 
-    def forward(self, y_hat_nhwc: torch.Tensor, ctx_nhwc: torch.Tensor) -> torch.Tensor:
+    def forward(self, y_hat_nhwc: torch.Tensor, ctx_nhwc: torch.Tensor):
         y_hat = y_hat_nhwc.permute(0, 3, 1, 2).contiguous()
         ctx = ctx_nhwc.permute(0, 3, 1, 2).contiguous()
-        feature = self.feature_dec(y_hat, ctx, self.q_dec)
+        feature = self.feature_dec(y_hat, ctx)
         value = self.mlp_norm0(self.pixel_unshuffle(feature))
         value = self.mlp_block0(value)
         value = self.mlp_norm1(value)
-        value = value * torch.sigmoid(value)
+        value = standard_silu_no_fusion(value)
         codeword = self.mlp_block1(value)
         frame = self.generator(codeword)
-        return frame.permute(0, 2, 3, 1).contiguous()
+        return (
+            feature.permute(0, 2, 3, 1).contiguous(),
+            frame.permute(0, 2, 3, 1).contiguous(),
+        )
+
+
+class PSourceFullSynthesisNhwc(nn.Module):
+    """Unmodified source path used only as the server precision authority."""
+
+    def __init__(self, model: nn.Module, qp: int) -> None:
+        super().__init__()
+        self.feature_dec = model.dec
+        self.generator = model.recon_generation_net
+        self.register_buffer("q_dec", model.q_scale_dec[qp : qp + 1].detach().clone())
+        self.register_buffer("q_recon", model.q_scale_recon[qp : qp + 1].detach().clone())
+
+    def forward(self, y_hat_nhwc: torch.Tensor, ctx_nhwc: torch.Tensor):
+        y_hat = y_hat_nhwc.permute(0, 3, 1, 2).contiguous()
+        ctx = ctx_nhwc.permute(0, 3, 1, 2).contiguous()
+        feature = self.feature_dec(y_hat, ctx, self.q_dec)
+        frame = self.generator(feature, self.q_recon)
+        return (
+            feature.permute(0, 2, 3, 1).contiguous(),
+            frame.permute(0, 2, 3, 1).contiguous(),
+        )
 
 
 class IFeatureDecNhwc(nn.Module):
@@ -264,16 +323,36 @@ class IFeatureDecNhwc(nn.Module):
         return codeword.permute(0, 2, 3, 1).contiguous()
 
 
+class FixedPFeatureDec(nn.Module):
+    """P FeatureDec with source DepthConvBlocks expanded to standard ops."""
+
+    def __init__(self, model: nn.Module, qp: int) -> None:
+        super().__init__()
+        source = model.dec
+        self.up = source.up
+        self.conv1 = nn.ModuleList(
+            ExplicitDepthConvBlock(block) for block in source.conv1
+        )
+        self.conv2 = source.conv2
+        self.register_buffer("q_dec", model.q_scale_dec[qp : qp + 1].detach().clone())
+
+    def forward(self, y_hat: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+        value = self.up(y_hat)
+        value = torch.cat((value, ctx), dim=1)
+        for block in self.conv1:
+            value = block(value)
+        return self.conv2(value) * self.q_dec
+
+
 class PFeatureDecNhwc(nn.Module):
     def __init__(self, model: nn.Module, qp: int) -> None:
         super().__init__()
-        self.feature_dec = model.dec
-        self.register_buffer("q_dec", model.q_scale_dec[qp : qp + 1].detach().clone())
+        self.feature_dec = FixedPFeatureDec(model, qp)
 
     def forward(self, y_hat_nhwc: torch.Tensor, ctx_nhwc: torch.Tensor) -> torch.Tensor:
         y_hat = y_hat_nhwc.permute(0, 3, 1, 2).contiguous()
         ctx = ctx_nhwc.permute(0, 3, 1, 2).contiguous()
-        feature = self.feature_dec(y_hat, ctx, self.q_dec)
+        feature = self.feature_dec(y_hat, ctx)
         return feature.permute(0, 2, 3, 1).contiguous()
 
 
@@ -283,7 +362,7 @@ class PCodewordMlp0Nhwc(nn.Module):
         mlp = model.recon_generation_net.mlp
         self.pixel_unshuffle = FixedPixelUnshuffle2()
         self.norm = FixedGroupNorm(mlp[0], 16, 32)
-        self.block = mlp[1]
+        self.block = ExplicitDepthConvBlock(mlp[1])
 
     def forward(self, feature_nhwc: torch.Tensor) -> torch.Tensor:
         feature = feature_nhwc.permute(0, 3, 1, 2).contiguous()
@@ -296,12 +375,12 @@ class PCodewordMlp1Nhwc(nn.Module):
         super().__init__()
         mlp = model.recon_generation_net.mlp
         self.norm = FixedGroupNorm(mlp[2], 16, 32)
-        self.block = mlp[3]
+        self.block = ExplicitDepthConvBlock(mlp[3])
 
     def forward(self, value_nhwc: torch.Tensor) -> torch.Tensor:
         value = value_nhwc.permute(0, 3, 1, 2).contiguous()
         value = self.norm(value)
-        value = value * torch.sigmoid(value)
+        value = standard_silu_no_fusion(value)
         codeword = self.block(value)
         return codeword.permute(0, 2, 3, 1).contiguous()
 
@@ -414,20 +493,148 @@ def run(command: list[str], log_path: Path) -> int:
         ).returncode
 
 
+def as_tuple(value):
+    return value if isinstance(value, tuple) else (value,)
+
+
+def compare(actual: np.ndarray, expected: np.ndarray) -> dict:
+    delta = actual.astype(np.float64) - expected.astype(np.float64)
+    absolute = np.abs(delta)
+    return {
+        "max_abs": float(absolute.max()) if absolute.size else 0.0,
+        "mean_abs": float(absolute.mean()) if absolute.size else 0.0,
+        "rmse": float(math.sqrt(np.mean(delta * delta))) if delta.size else 0.0,
+    }
+
+
+def deterministic_samples(samples: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(20260723)
+    return tuple(
+        torch.randn(sample.shape, dtype=torch.float32, generator=generator) * 0.25
+        for sample in samples
+    )
+
+
+def run_tflite(
+    path: Path,
+    samples: tuple[torch.Tensor, ...],
+) -> tuple[tuple[np.ndarray, ...], str]:
+    try:
+        import mtk_converter
+    except ImportError:
+        try:
+            from tflite_runtime.interpreter import Interpreter
+        except ImportError:
+            import tensorflow as tf
+
+            Interpreter = tf.lite.Interpreter
+
+        interpreter = Interpreter(model_path=str(path))
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        remaining = list(samples)
+        for detail in input_details:
+            shape = tuple(int(value) for value in detail["shape"])
+            match = next((index for index, sample in enumerate(remaining) if tuple(sample.shape) == shape), None)
+            if match is None:
+                raise RuntimeError(f"cannot map TFLite input shape {shape}")
+            sample = remaining.pop(match)
+            interpreter.set_tensor(detail["index"], sample.contiguous().numpy().astype(detail["dtype"]))
+        interpreter.invoke()
+        outputs = tuple(
+            interpreter.get_tensor(detail["index"])
+            for detail in interpreter.get_output_details()
+        )
+        return outputs, "tensorflow_lite_interpreter"
+
+    inputs = [sample.contiguous().numpy() for sample in samples]
+    outputs = mtk_converter.TFLiteExecutor(str(path)).run(inputs)
+    return tuple(np.asarray(output) for output in outputs), "mtk_converter.TFLiteExecutor"
+
+
+def order_outputs_by_shape(
+    outputs: tuple[np.ndarray, ...],
+    expected: tuple[torch.Tensor, ...],
+) -> tuple[np.ndarray, ...]:
+    remaining = list(outputs)
+    ordered = []
+    for tensor in expected:
+        shape = tuple(tensor.shape)
+        match = next((index for index, value in enumerate(remaining) if tuple(value.shape) == shape), None)
+        if match is None:
+            raise RuntimeError(f"cannot map TFLite output shape {shape}")
+        ordered.append(remaining.pop(match))
+    return tuple(ordered)
+
+
+def verify_merged(
+    module: nn.Module,
+    source_reference: nn.Module,
+    samples: tuple[torch.Tensor, ...],
+    tflite: Path,
+    output_names: list[str],
+) -> dict:
+    validation_inputs = deterministic_samples(samples)
+    with torch.no_grad():
+        rewritten_outputs = as_tuple(module.cpu().eval()(*validation_inputs))
+        source_outputs = as_tuple(source_reference.cpu().eval()(*validation_inputs))
+    tflite_raw, tflite_executor = run_tflite(tflite, validation_inputs)
+    tflite_outputs = order_outputs_by_shape(tflite_raw, rewritten_outputs)
+    comparisons = {}
+    passed = True
+    for name, rewritten, source, tflite_output in zip(
+        output_names, rewritten_outputs, source_outputs, tflite_outputs
+    ):
+        rewritten_numpy = rewritten.detach().contiguous().numpy()
+        source_numpy = source.detach().contiguous().numpy()
+        source_metrics = compare(rewritten_numpy, source_numpy)
+        tflite_metrics = compare(tflite_output, rewritten_numpy)
+        output_passed = (
+            source_metrics["max_abs"] <= 1e-3
+            and source_metrics["rmse"] <= 1e-4
+            and tflite_metrics["max_abs"] <= 1e-3
+            and tflite_metrics["rmse"] <= 1e-4
+        )
+        comparisons[name] = {
+            "rewritten_vs_source": source_metrics,
+            "tflite_vs_rewritten": tflite_metrics,
+            "passed": output_passed,
+        }
+        passed = passed and output_passed
+    return {
+        "fixture_seed": 20260723,
+        "max_abs_threshold": 1e-3,
+        "rmse_threshold": 1e-4,
+        "tflite_executor": tflite_executor,
+        "outputs": comparisons,
+        "passed": passed,
+    }
+
+
 def export_one(
     name: str,
     module: nn.Module,
     samples: tuple[torch.Tensor, ...],
     converter: str,
+    tflite_op_export_spec: str,
     ncc: str,
     arch: str,
     output_dir: Path,
+    input_names: Optional[list[str]] = None,
+    output_names: Optional[list[str]] = None,
+    source_reference: Optional[nn.Module] = None,
 ) -> dict:
+    input_names = input_names or [f"input_{index}" for index in range(len(samples))]
     pt_path = output_dir / f"{name}.pt"
     with torch.no_grad():
         scripted = torch.jit.trace(module.cpu().eval(), samples, strict=False)
-        actual_shape = list(scripted(*samples).shape)
+        actual_outputs = as_tuple(scripted(*samples))
+        actual_shapes = [list(output.shape) for output in actual_outputs]
         scripted.save(str(pt_path))
+    output_names = output_names or [f"output_{index}" for index in range(len(actual_outputs))]
+    if len(output_names) != len(actual_outputs):
+        raise ValueError(f"{name}: output_names count does not match traced outputs")
     tflite = output_dir / f"{name}.tflite"
     converter_log = output_dir / "logs" / f"{name}_converter.log"
     converter_rc = run(
@@ -435,6 +642,7 @@ def export_one(
             converter,
             "--input_script_module_file", str(pt_path),
             "--output_file", str(tflite),
+            "--tflite_op_export_spec", tflite_op_export_spec,
             "--input_shapes", ":".join(
                 ",".join(str(dim) for dim in sample.shape) for sample in samples
             ),
@@ -443,18 +651,32 @@ def export_one(
     )
     record = {
         "name": name,
+        "input_names": input_names,
         "input_shapes_nhwc": [list(sample.shape) for sample in samples],
-        "actual_output_shape_nhwc": actual_shape,
+        "output_names": output_names,
+        "actual_output_shapes_nhwc": actual_shapes,
+        "actual_output_shape_nhwc": actual_shapes[0] if len(actual_shapes) == 1 else None,
         "torchscript": str(pt_path),
         "torchscript_sha256": sha256(pt_path),
         "converter_rc": converter_rc,
+        "tflite_op_export_spec": tflite_op_export_spec,
         "converter_log": str(converter_log),
         "tflite": str(tflite) if tflite.is_file() else None,
         "tflite_sha256": sha256(tflite) if tflite.is_file() else None,
+        "contains_mtkext_silu": (
+            b"MTKEXT_SILU" in tflite.read_bytes() if tflite.is_file() else False
+        ),
     }
     if converter_rc != 0 or not tflite.is_file():
         record["status"] = "converter_failed"
         return record
+    if source_reference is not None:
+        try:
+            record["precision"] = verify_merged(
+                module, source_reference, samples, tflite, output_names
+            )
+        except Exception as exc:
+            record["precision"] = {"passed": False, "error": repr(exc)}
     ncc_record = analyze_one(
         tflite=tflite,
         ncc=ncc,
@@ -464,6 +686,15 @@ def export_one(
         ncc_flags=["--opt-bw", "--relax-fp32"],
     )
     record["ncc"] = ncc_record
+    plan_log = Path(ncc_record.get("exec_plan_log") or "")
+    plan_text = plan_log.read_text(encoding="utf-8", errors="replace") if plan_log.is_file() else ""
+    targets = sorted({
+        line.split("Target:", 1)[1].strip()
+        for line in plan_text.splitlines()
+        if "Target:" in line
+    })
+    record["execution_targets"] = targets
+    record["mdla_only"] = bool(targets) and all(target.startswith("MDLA") for target in targets)
     record["offline_compile_ok"] = (
         ncc_record.get("check_target_rc") == 0
         and ncc_record.get("exec_plan_rc") == 0
@@ -471,7 +702,18 @@ def export_one(
         and bool(ncc_record.get("dla"))
         and Path(ncc_record["dla"]).is_file()
     )
-    record["status"] = "ok" if record["offline_compile_ok"] else "ncc_failed"
+    if record["contains_mtkext_silu"]:
+        record["status"] = "runtime_incompatible_custom_op"
+    elif not record["offline_compile_ok"]:
+        record["status"] = "ncc_failed"
+    elif source_reference is not None and record.get("precision", {}).get("error"):
+        record["status"] = "precision_unavailable"
+    elif source_reference is not None and not record.get("precision", {}).get("passed"):
+        record["status"] = "precision_failed"
+    elif source_reference is not None and not record["mdla_only"]:
+        record["status"] = "target_failed"
+    else:
+        record["status"] = "ok"
     return record
 
 
@@ -495,6 +737,8 @@ def publish_offline_assets(
         }
 
     for record in records:
+        if record.get("name", "").endswith("_merged_fp32"):
+            continue
         if record.get("status") != "ok" or not record.get("offline_compile_ok"):
             continue
         ncc_record = record.get("ncc") or {}
@@ -526,12 +770,70 @@ def publish_offline_assets(
     return manifest_path
 
 
+def publish_merged_offline_assets(
+    records: list[dict],
+    android_root: Path,
+    checkpoint_sha256: dict[str, str],
+    qp: int,
+    arch: str,
+) -> Path:
+    assets_dir = android_root / "app" / "src" / "mtkOffline" / "assets" / "offline_models"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = assets_dir / "decoder_merged_offline_manifest.json"
+    published = []
+    for record in records:
+        if (
+            record.get("status") != "ok"
+            or not record.get("offline_compile_ok")
+            or not record.get("mdla_only")
+            or not record.get("precision", {}).get("passed")
+        ):
+            continue
+        source_dla = Path((record.get("ncc") or {}).get("dla") or "")
+        if not source_dla.is_file():
+            continue
+        target_dla = assets_dir / f"{record['name']}.dla"
+        shutil.copy2(source_dla, target_dla)
+        published.append({
+            "name": record["name"],
+            "asset": f"offline_models/{target_dla.name}",
+            "dla_sha256": sha256(target_dla),
+            "tflite_sha256": record.get("tflite_sha256"),
+            "torchscript_sha256": record.get("torchscript_sha256"),
+            "input_names": record.get("input_names"),
+            "input_shapes_nhwc": record.get("input_shapes_nhwc"),
+            "output_names": record.get("output_names"),
+            "output_shapes_nhwc": record.get("actual_output_shapes_nhwc"),
+            "execution_targets": record.get("execution_targets"),
+            "offline_compile_verified": True,
+            "precision_verified": True,
+            "precision": record.get("precision"),
+        })
+    manifest = {
+        "deployment_path": "mtk_offline",
+        "component": "decoder_synthesis_merged",
+        "arch": arch,
+        "qp": qp,
+        "checkpoint_sha256": checkpoint_sha256,
+        "segmented_fallback_manifest": "offline_models/decoder_offline_manifest.json",
+        "models": sorted(published, key=lambda item: item["name"]),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--android-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--pytorch-converter", default=None)
+    parser.add_argument(
+        "--tflite-op-export-spec",
+        choices=("legacy", "legacy_ignore_version", "builtin_first", "custom_first"),
+        default="builtin_first",
+        help="Prefer standard TFLite operators so server-side precision validation can execute the model",
+    )
     parser.add_argument("--ncc-tflite", required=True)
     parser.add_argument("--arch", default="mdla5.3")
     parser.add_argument("--qp", type=int, default=0)
@@ -539,6 +841,11 @@ def main() -> None:
         "--copy-offline-assets",
         action="store_true",
         help="Copy only successfully compiled DLA files into the mtkOffline flavor",
+    )
+    parser.add_argument(
+        "--copy-merged-assets",
+        action="store_true",
+        help="Publish only precision-verified I/P merged DLA files to a separate manifest",
     )
     parser.add_argument(
         "--targets",
@@ -586,6 +893,10 @@ def main() -> None:
         unknown = [item for item in selected_keys if item not in valid_keys]
         if unknown:
             raise ValueError(f"unknown --targets entries: {unknown}")
+    if not selected_keys:
+        raise ValueError("--targets must select at least one target")
+    if args.copy_merged_assets and any(key not in {"i", "p"} for key in selected_keys):
+        raise ValueError("--copy-merged-assets only supports --targets i,p (or one of them)")
 
     i_generator = FixedGenerator(i_model.cpu().eval(), args.qp) if any(
         key in i_segment_keys for key in selected_keys
@@ -625,12 +936,12 @@ def main() -> None:
             ),
         ),
         "i": lambda: (
-            "i_decoder_synthesis_norm_rewrite_fp32",
+            "i_decoder_synthesis_merged_fp32",
             IFullSynthesisNhwc(i_model.cpu().eval(), args.qp),
             (torch.zeros((1, 16, 32, 256), dtype=torch.float32),),
         ),
         "p": lambda: (
-            "p_decoder_synthesis_norm_rewrite_fp32",
+            "p_decoder_synthesis_merged_fp32",
             PFullSynthesisNhwc(p_model.cpu().eval(), args.qp),
             (
                 torch.zeros((1, 16, 32, 128), dtype=torch.float32),
@@ -674,10 +985,28 @@ def main() -> None:
     candidates = [all_candidates[key]() for key in selected_keys]
     records = []
     manifest_path = output_dir / "decoder_full_norm_rewrite_manifest.json"
-    for index, (name, module, samples) in enumerate(candidates, start=1):
+    for index, ((name, module, samples), target_key) in enumerate(zip(candidates, selected_keys), start=1):
         print(f"[decoder-full] {index}/{len(candidates)} export={name}", flush=True)
         try:
-            record = export_one(name, module, samples, converter, ncc, args.arch, output_dir)
+            if target_key == "i":
+                input_names = ["i_y_hat"]
+                output_names = ["i_reference_frame"]
+                source_reference = ISourceFullSynthesisNhwc(i_model.cpu().eval(), args.qp)
+            elif target_key == "p":
+                input_names = ["p_y_hat", "p_ctx"]
+                output_names = ["p_reference_feature", "p_reference_frame"]
+                source_reference = PSourceFullSynthesisNhwc(p_model.cpu().eval(), args.qp)
+            else:
+                input_names = None
+                output_names = None
+                source_reference = None
+            record = export_one(
+                name, module, samples, converter, args.tflite_op_export_spec,
+                ncc, args.arch, output_dir,
+                input_names=input_names,
+                output_names=output_names,
+                source_reference=source_reference,
+            )
         except Exception as exc:
             record = {"name": name, "status": "exception", "error": repr(exc)}
         records.append(record)
@@ -700,6 +1029,24 @@ def main() -> None:
         }
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         print(f"[decoder-full] {name} status={record['status']}", flush=True)
+        precision = record.get("precision") or {}
+        if precision.get("error"):
+            print(
+                f"[decoder-full] {name} precision_error={precision['error']}",
+                flush=True,
+            )
+        for output_name, metrics in (precision.get("outputs") or {}).items():
+            source_metrics = metrics.get("rewritten_vs_source") or {}
+            tflite_metrics = metrics.get("tflite_vs_rewritten") or {}
+            print(
+                f"[decoder-full] {name} output={output_name} "
+                f"rewritten_vs_source_max_abs={source_metrics.get('max_abs')} "
+                f"rewritten_vs_source_rmse={source_metrics.get('rmse')} "
+                f"tflite_vs_rewritten_max_abs={tflite_metrics.get('max_abs')} "
+                f"tflite_vs_rewritten_rmse={tflite_metrics.get('rmse')} "
+                f"passed={metrics.get('passed')}",
+                flush=True,
+            )
     print(f"wrote {manifest_path}")
     if args.copy_offline_assets:
         offline_manifest = publish_offline_assets(
@@ -714,6 +1061,21 @@ def main() -> None:
             if record.get("status") == "ok" and record.get("offline_compile_ok")
         )
         print(f"published_offline_models={published_count} manifest={offline_manifest}")
+    if args.copy_merged_assets:
+        merged_manifest = publish_merged_offline_assets(
+            records=records,
+            android_root=android_root,
+            checkpoint_sha256={"i": i_sha, "p": p_sha},
+            qp=args.qp,
+            arch=args.arch,
+        )
+        published_count = sum(
+            1 for record in records
+            if record.get("status") == "ok"
+            and record.get("precision", {}).get("passed")
+            and record.get("mdla_only")
+        )
+        print(f"published_merged_models={published_count} manifest={merged_manifest}")
 
 
 if __name__ == "__main__":

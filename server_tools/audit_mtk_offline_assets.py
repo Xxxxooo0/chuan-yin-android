@@ -45,6 +45,10 @@ EXPECTED = {
         "p_generator_stage4_norm_rewrite_fp32",
         "p_generator_final_norm_rewrite_fp32",
     },
+    "decoder_merged_offline_manifest.json": {
+        "i_decoder_synthesis_merged_fp32",
+        "p_decoder_synthesis_merged_fp32",
+    },
 }
 
 
@@ -90,6 +94,12 @@ def main() -> None:
                 continue
             if not record.get("offline_compile_verified"):
                 failures.append(f"{name} is not marked offline_compile_verified")
+                continue
+            if (
+                manifest_name == "decoder_merged_offline_manifest.json"
+                and not record.get("precision_verified")
+            ):
+                failures.append(f"{name} is not marked precision_verified")
                 continue
             verified += 1
 
