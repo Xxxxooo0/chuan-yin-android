@@ -44,6 +44,13 @@ python server_tools/package_enterprise_dla_codec.py --help
 python server_tools/package_enterprise_dla_with_inputs.py --help
 ```
 
+## Large 在线 entropy/prior
+
+I 帧只导出 `i_entropy_prior_merged_fp32.tflite`，不再部署旧的 7 张 I 分图。P 帧暂时
+使用 `export_entropy_offline_nhwc.py --candidates p_hyper_enc_continuous,...` 导出 4 张
+连续网络图。完整命令、独立模型文件和 Android 测试入口见
+[Large 在线部署](../docs/large-online-deployment.md)。
+
 ## 结果审计
 
 使用 `audit_mtk_offline_assets.py` 检查离线模型的 manifest、SHA 和 NCC 结果。`compare_enterprise_precision_outputs.py` 用企业回传的输出与参考向量生成精度报告。

@@ -26,6 +26,10 @@ Large 与 Small 均使用同一 APK；模型包位于独立的本地模型分支
 
 也可使用 `enterpriseTfliteVariant=all` 依次检查两个变体。`mtkOffline` 是历史 source set 名称，不表示当前加载 `.dla`。
 
+Large 的 I 帧 entropy/prior 使用独立的 `online_entropy/i_entropy_prior_merged.tflite`，
+不进入基础模型压缩包；设备部署时单独放到 `enterprise_tflite/large/models/`。旧的 7 张
+I entropy/prior 分图不再属于当前在线路径。
+
 ## 后续路线：MTK 离线 DLA
 
 服务器脚本可生成 NCC 验证的 `.dla` 企业交付物：

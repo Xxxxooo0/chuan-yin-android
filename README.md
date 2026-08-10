@@ -9,6 +9,8 @@
 
 项目文档导航见 [docs/README.md](docs/README.md)。部署路线、源码集和应用 ID 见 [docs/deployment-variants.md](docs/deployment-variants.md)；项目目录职责见 [docs/repository-layout.md](docs/repository-layout.md)，全部模型位置与用途见 [models/README.md](models/README.md)。历史 Recon 分段诊断、MNN/GPU 探针和旧 native TFLite 诊断实验已移除，不再作为部署入口。
 
+Large 在线 I 帧合并熵模型的独立部署、测速和精度 dump 命令见 [GVC-RT Large 在线部署](docs/large-online-deployment.md)。
+
 ## 本机构建
 
 ```powershell
@@ -25,7 +27,7 @@ cd D:\android\ceshi\GVC-RT_clean_android
 $adb = '.\sdk\platform-tools\adb.exe'
 & $adb install -r .\app\build\outputs\apk\onnxDemo\debug\app-onnxDemo-debug.apk
 & $adb logcat -c
-& $adb shell am start -n com.gvcrt.clean.onnxdemo/.MainActivity --ez imageInferenceTest true
+& $adb shell am start -n com.gvcrt.clean.onnxdemo/com.gvcrt.clean.MainActivity --ez imageInferenceTest true
 & $adb logcat -d -s GVC_RT_CLEAN:I
 ```
 

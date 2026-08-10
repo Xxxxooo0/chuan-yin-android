@@ -3,6 +3,7 @@ package com.gvcrt.clean
 import android.content.Context
 import android.os.SystemClock
 import com.mediatek.neuropilot_V.neuron.NeuronDelegate
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
@@ -38,9 +39,10 @@ class LargePEntropyCodecProbe(
                 "missing I reference frame; run largeIEntropyCodecTest first: ${iReferenceFile.absolutePath}"
             }
             val iReference = TensorIO.readF32Le("i_reference_frame", FRAME_SHAPE, iReferenceFile.readBytes())
+            val temporalRuntime = runtime("temporal_from_frame")
             val temporal = timed("p_temporal_from_frame") {
                 runNchw(
-                    runtime("temporal_from_frame"),
+                    temporalRuntime,
                     listOf(NhwcTensorCodec.toF32Le(iReference)),
                     listOf(
                         TensorSpec("p_reference_feature_initial", CTX_SHAPE),
@@ -52,31 +54,35 @@ class LargePEntropyCodecProbe(
             val ctx = temporal[1]
             val ctxT = temporal[2]
             val inputFrame = packageRoot.resolve(p.getString("input_p_frame")).readBytes()
+            val encoderRuntime = runtime("p_encoder")
             val y = timed("p_encoder") {
                 runNchw(
-                    runtime("p_encoder"),
+                    encoderRuntime,
                     listOf(inputFrame, NhwcTensorCodec.toF32Le(ctx)),
                     listOf(TensorSpec("p_y_pre_prior", Y_SHAPE)),
                 ).single()
             }
+            val hyperEncRuntime = runtime("p_hyper_enc_continuous")
             val zPreQuant = timed("p_hyper_enc") {
                 runNchw(
-                    runtime("p_hyper_enc_continuous"),
+                    hyperEncRuntime,
                     listOf(NhwcTensorCodec.toF32Le(y)),
                     listOf(TensorSpec("p_z_pre_quant", Z_SHAPE)),
                 ).single()
             }
             val zHat = timed("p_z_quant") { quantizeInt8(zPreQuant, "p_z_hat") }
+            val hyperPriorRuntime = runtime("p_hyper_prior_shared")
             val common = timed("p_hyper_prior") {
                 runNchw(
-                    runtime("p_hyper_prior_shared"),
+                    hyperPriorRuntime,
                     listOf(NhwcTensorCodec.toF32Le(zHat), NhwcTensorCodec.toF32Le(ctxT)),
                     listOf(TensorSpec("p_common_params", COMMON_SHAPE)),
                 ).single()
             }
+            val priorStage0Runtime = runtime("p_prior_stage0_params")
             val stage0Params = timed("p_prior_stage0") {
                 runNchw(
-                    runtime("p_prior_stage0_params"),
+                    priorStage0Runtime,
                     listOf(NhwcTensorCodec.toF32Le(common)),
                     listOf(
                         TensorSpec("p_q_dec", Y_SHAPE),
@@ -97,9 +103,10 @@ class LargePEntropyCodecProbe(
                     forceZeroThreshold = forceZero,
                 ).also(quantized::add).yHat
             }
+            val priorStage1Runtime = runtime("p_prior_stage1_continuous")
             val stage1Params = timed("p_prior_stage1") {
                 runNchw(
-                    runtime("p_prior_stage1_continuous"),
+                    priorStage1Runtime,
                     listOf(NhwcTensorCodec.toF32Le(yHatSoFar), NhwcTensorCodec.toF32Le(common)),
                     listOf(
                         TensorSpec("p_stage1_scales", Y_SHAPE),
@@ -144,9 +151,10 @@ class LargePEntropyCodecProbe(
                     }
                 }
             }
+            val decoderRuntime = runtime("p_decoder")
             val decoded = timed("p_decoder") {
                 runNchw(
-                    runtime("p_decoder"),
+                    decoderRuntime,
                     listOf(NhwcTensorCodec.toF32Le(yHat), NhwcTensorCodec.toF32Le(ctx)),
                     listOf(
                         TensorSpec("p_reference_feature", CTX_SHAPE),
@@ -156,11 +164,17 @@ class LargePEntropyCodecProbe(
             }
             val outputRoot = context.getExternalFilesDir(null)!!
                 .resolve("enterprise_tflite_codec/large/p")
-            outputRoot.mkdirs()
-            outputRoot.resolve("p_rans_payload.bin").writeBytes(payload)
-            outputRoot.resolve("p_y_hat.nchw.f32le").writeBytes(TensorIO.f32Le(yHat))
-            outputRoot.resolve("p_reference_feature.nchw.f32le").writeBytes(TensorIO.f32Le(decoded[0]))
-            outputRoot.resolve("p_reference_frame.nchw.f32le").writeBytes(TensorIO.f32Le(decoded[1]))
+            writeOutputs(
+                outputRoot = outputRoot,
+                ctx = ctx,
+                ctxT = ctxT,
+                zHat = zHat,
+                quantized = quantized,
+                yHat = yHat,
+                referenceFeature = decoded[0],
+                referenceFrame = decoded[1],
+                payload = payload,
+            )
             emit(
                 "large_p_codec_complete payload_bytes=${payload.size} payload_sha256=${sha256(payload)} " +
                     "rans_roundtrip=PASS output=${outputRoot.absolutePath}",
@@ -168,6 +182,55 @@ class LargePEntropyCodecProbe(
         } finally {
             runtimes.values.forEach(OfficialNeuronRuntime::close)
         }
+    }
+
+    private fun writeOutputs(
+        outputRoot: File,
+        ctx: TensorValue,
+        ctxT: TensorValue,
+        zHat: TensorValue,
+        quantized: List<EntropyPriorStage>,
+        yHat: TensorValue,
+        referenceFeature: TensorValue,
+        referenceFrame: TensorValue,
+        payload: ByteArray,
+    ) {
+        outputRoot.mkdirs()
+        val tensors = linkedMapOf<String, TensorValue>()
+        tensors["p_ctx"] = ctx
+        tensors["p_ctx_t"] = ctxT
+        tensors["p_z_hat"] = zHat
+        quantized.forEachIndexed { index, stage ->
+            tensors["p_y_q_w_$index"] = stage.symbols
+            tensors["p_s_w_$index"] = stage.scales
+        }
+        tensors["p_y_hat"] = yHat
+        tensors["p_reference_feature"] = referenceFeature
+        tensors["p_reference_frame"] = referenceFrame
+        val records = JSONArray()
+        tensors.forEach { (name, tensor) ->
+            val bytes = TensorIO.f32Le(tensor)
+            val fileName = "$name.nchw.f32le"
+            outputRoot.resolve(fileName).writeBytes(bytes)
+            records.put(
+                JSONObject()
+                    .put("name", name)
+                    .put("file", fileName)
+                    .put("shape", JSONArray(tensor.shape.toList()))
+                    .put("sha256", sha256(bytes)),
+            )
+            emit(
+                "large_p_codec_output tensor=$name shape=${TensorIO.shapeText(tensor.shape)} " +
+                    "sha256=${sha256(bytes)}",
+            )
+        }
+        outputRoot.resolve("p_rans_payload.bin").writeBytes(payload)
+        val manifest = JSONObject()
+            .put("layout", "NCHW")
+            .put("dtype", "float32 little-endian")
+            .put("tensors", records)
+            .put("payload", JSONObject().put("file", "p_rans_payload.bin").put("sha256", sha256(payload)))
+        outputRoot.resolve("output_manifest.json").writeText(manifest.toString(2))
     }
 
     private fun runNchw(
@@ -232,7 +295,9 @@ class LargePEntropyCodecProbe(
 
     private fun <T> timed(label: String, block: () -> T): T {
         val started = SystemClock.elapsedRealtimeNanos()
-        return block().also { emit("large_p_codec_speed stage=$label elapsed_ms=${format(elapsedMs(started))}") }
+        return block().also {
+            emit("large_p_codec_speed stage=$label elapsed_ms=${format(elapsedMs(started))} includes_create=false")
+        }
     }
 
     private fun elapsedMs(started: Long): Double =

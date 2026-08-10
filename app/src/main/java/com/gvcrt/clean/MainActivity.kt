@@ -61,6 +61,15 @@ class MainActivity : Activity() {
         val imageInferenceButton = moduleButton("Image\ninfer") {
             startTests(listOf("image_inference"))
         }
+        val largeIPrecisionButton = moduleButton("Large I\nprecision") {
+            startTests(listOf("large_i_entropy_merged_precision"))
+        }
+        val largeISpeedButton = moduleButton("Large I\nspeed") {
+            startTests(listOf("large_i_entropy_merged_speed"))
+        }
+        val largeIpCodecButton = moduleButton("Large I/P\ncodec") {
+            startTests(listOf("large_i_entropy_codec", "large_p_entropy_codec"))
+        }
         moduleButtons = buildList {
             addAll(
                 listOf(
@@ -74,6 +83,11 @@ class MainActivity : Activity() {
                     imageInferenceButton,
                 )
             )
+            if (!isOnnxDemo) {
+                add(largeIPrecisionButton)
+                add(largeISpeedButton)
+                add(largeIpCodecButton)
+            }
         }
 
         val controls = LinearLayout(this).apply {
@@ -99,6 +113,14 @@ class MainActivity : Activity() {
             addView(fullProjectButton, buttonLayoutParams())
             addView(imageInferenceButton, buttonLayoutParams())
         }
+        val largeControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(16, 0, 16, 0)
+            addView(largeIPrecisionButton, buttonLayoutParams())
+            addView(largeISpeedButton, buttonLayoutParams())
+            addView(largeIpCodecButton, buttonLayoutParams())
+        }
         inputImage = comparisonImageView()
         reconImage = comparisonImageView()
         reconTitle = comparisonTitle("Reconstruction")
@@ -120,6 +142,9 @@ class MainActivity : Activity() {
             addView(controls)
             addView(speedControls)
             addView(projectControls)
+            if (!isOnnxDemo) {
+                addView(largeControls)
+            }
             addView(
                 imageComparison,
                 LinearLayout.LayoutParams(
@@ -173,10 +198,10 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("sequenceInferenceTest", false) -> listOf("sequence_inference")
             intent.getBooleanExtra("largeIpEntropyCodecTest", false) ->
                 listOf("large_i_entropy_codec", "large_p_entropy_codec")
-            intent.getBooleanExtra("largeIEntropyNhwcTest", false) -> listOf("large_i_entropy_nhwc")
-            intent.getBooleanExtra("largeIEntropyMergedTest", false) -> listOf("large_i_entropy_merged")
+            intent.getBooleanExtra("largeIEntropyMergedSpeedTest", false) -> listOf("large_i_entropy_merged_speed")
+            intent.getBooleanExtra("largeIEntropyMergedPrecisionTest", false) ||
+                intent.getBooleanExtra("largeIEntropyMergedTest", false) -> listOf("large_i_entropy_merged_precision")
             intent.getBooleanExtra("largeIEntropyCodecTest", false) -> listOf("large_i_entropy_codec")
-            intent.getBooleanExtra("largeIEntropyCpu4Test", false) -> listOf("large_i_entropy_cpu4")
             intent.getBooleanExtra("largePEntropyCodecTest", false) -> listOf("large_p_entropy_codec")
             intent.getBooleanExtra("enterpriseTfliteTest", false) -> listOf("enterprise_tflite")
             else -> emptyList()
@@ -307,24 +332,20 @@ class MainActivity : Activity() {
                         moduleName == "large_i_entropy_codec" -> {
                             LargeIEntropyCodecProbe(this, ::emit).run()
                         }
-                        moduleName == "large_i_entropy_nhwc" -> {
-                            LargeIEntropyCodecProbe(this, ::emit).run(useNhwcEntropy = true)
-                        }
-                        moduleName == "large_i_entropy_merged" -> {
+                        moduleName == "large_i_entropy_merged_precision" -> {
                             LargeIEntropyCodecProbe(this, ::emit).run(
-                                useMergedEntropy = true,
-                                compareMergedAgainstNhwc = intent.getBooleanExtra(
-                                    "largeIEntropyMergedCompareSplit",
-                                    true,
-                                ),
-                                mergedWarmupRuns = intent.getIntExtra("largeIEntropyMergedWarmup", 3),
-                                mergedMeasuredRuns = intent.getIntExtra("largeIEntropyMergedMeasured", 10),
+                                warmupRuns = 0,
+                                measuredRuns = 1,
+                                validateRoundtrip = true,
+                                dumpOutputs = true,
                             )
                         }
-                        moduleName == "large_i_entropy_cpu4" -> {
-                            LargeIEntropyCpu4Benchmark(this, ::emit).run(
-                                warmupRuns = intent.getIntExtra("largeIEntropyCpu4Warmup", 3),
-                                measuredRuns = intent.getIntExtra("largeIEntropyCpu4Measured", 10),
+                        moduleName == "large_i_entropy_merged_speed" -> {
+                            LargeIEntropyCodecProbe(this, ::emit).run(
+                                warmupRuns = intent.getIntExtra("largeIEntropyMergedWarmup", 3),
+                                measuredRuns = intent.getIntExtra("largeIEntropyMergedMeasured", 10),
+                                validateRoundtrip = false,
+                                dumpOutputs = false,
                             )
                         }
                         moduleName == "large_p_entropy_codec" -> {

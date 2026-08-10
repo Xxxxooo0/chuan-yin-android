@@ -5,6 +5,7 @@
 ## 当前部署与交付
 
 - [部署路线](deployment-variants.md)：ONNX Demo、MTK 在线 Large/Small，以及后续 DLA 交付的边界。
+- [GVC-RT Large 在线部署](large-online-deployment.md)：独立 I 熵合并模型、服务器打包和 Android 测试命令。
 - [仓库目录说明](repository-layout.md)：各目录职责、本地生成物与模型 worktree 的位置。
 - [模型索引](../models/README.md)：ONNX 运行资产、Large/Small 包、校验文件及使用原则。
 - [服务端导出工具](../server_tools/README.md)：远端导出、离线编译、精度向量和结果审计命令。

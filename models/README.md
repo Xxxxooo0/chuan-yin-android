@@ -27,6 +27,10 @@ Gradle 将该资产目录作为 `onnxDemo` flavor 的额外 assets source。使�
 - Worktree：`models/large/`
 - 包目录：`models/large/local_models/gvc-rt-large/`
 - 当前推荐包：`gvc-rt-large_tflite_codec_270p_qp0_with_inputs_runtime-tested.tar.gz`
+- 独立 I 熵模型：`models/large/local_models/gvc-rt-large/online_entropy/i_entropy_prior_merged.tflite`
+
+I 熵合并模型不进入基础模型压缩包。部署时先解压基础包，再将该文件单独放入设备包的
+`models/i_entropy_prior_merged.tflite`。旧的 7 张 I entropy/prior 分图不再使用。
 
 ## GVC-RT Small
 

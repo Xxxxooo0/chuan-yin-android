@@ -13,20 +13,30 @@ class OfficialNeuronRuntime private constructor(
     val outputSizes: LongArray,
     val optionsSummary: String,
 ) : AutoCloseable {
+    private val inputBuffers = inputSizes.mapIndexed { index, size ->
+        allocateTensorBuffer("input[$index]", size)
+    }
+    private val outputBuffers = outputSizes.mapIndexed { index, size ->
+        allocateTensorBuffer("output[$index]", size)
+    }
+    private val outputs = outputBuffers.mapIndexed { index, buffer -> index to buffer }.toMap()
+
+    @Synchronized
     fun run(inputs: List<ByteArray>, copyOutputs: Boolean = true): List<ByteArray> {
         require(inputs.size == inputSizes.size) {
             "input count mismatch runtime=${inputSizes.size} actual=${inputs.size}"
         }
-        val inputBuffers = inputs.mapIndexed { index, bytes ->
+        inputs.forEachIndexed { index, bytes ->
             require(bytes.size.toLong() == inputSizes[index]) {
                 "input[$index] bytes mismatch runtime=${inputSizes[index]} actual=${bytes.size}"
             }
-            directBuffer(bytes)
+            inputBuffers[index].apply {
+                clear()
+                put(bytes)
+                rewind()
+            }
         }
-        val outputBuffers = outputSizes.map { size ->
-            ByteBuffer.allocateDirect(size.toInt()).order(ByteOrder.nativeOrder())
-        }
-        val outputs = outputBuffers.mapIndexed { index, buffer -> index to buffer }.toMap()
+        outputBuffers.forEach(ByteBuffer::clear)
         interpreter.runForMultipleInputsOutputs(inputBuffers.toTypedArray(), outputs)
         if (!copyOutputs) {
             return emptyList()
@@ -93,10 +103,9 @@ class OfficialNeuronRuntime private constructor(
             )
         }
 
-        private fun directBuffer(bytes: ByteArray): ByteBuffer =
-            ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder()).also {
-                it.put(bytes)
-                it.rewind()
-            }
+        private fun allocateTensorBuffer(label: String, size: Long): ByteBuffer {
+            require(size in 0..Int.MAX_VALUE.toLong()) { "$label byte size is unsupported: $size" }
+            return ByteBuffer.allocateDirect(size.toInt()).order(ByteOrder.nativeOrder())
+        }
     }
 }
