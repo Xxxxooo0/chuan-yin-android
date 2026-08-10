@@ -311,7 +311,7 @@ def analyze_one(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--android-root", type=Path, default=PROJECT_ROOT)
-    parser.add_argument("--assets-dir", type=Path, default=None)
+    parser.add_argument("--assets-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--ncc-tflite", default=None)
     parser.add_argument("--arch", default="mdla5.3")
@@ -328,11 +328,8 @@ def main() -> None:
     args = parser.parse_args()
 
     android_root = args.android_root.resolve()
-    assets_dir = (
-        args.assets_dir
-        or android_root / "app" / "src" / "mtkOffline" / "conversion_inputs" / "recon_diagnostic"
-    ).resolve()
-    output_dir = (args.output_dir or android_root / "outputs" / "recon_neuron_diagnostics").resolve()
+    assets_dir = args.assets_dir.resolve()
+    output_dir = (args.output_dir or android_root / "outputs" / "neuron_diagnostics").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ncc = find_ncc(args.ncc_tflite)
@@ -356,7 +353,7 @@ def main() -> None:
         "compile_dla": args.compile_dla,
         "records": records,
     }
-    summary_path = output_dir / "recon_neuron_diagnostics.json"
+    summary_path = output_dir / "neuron_diagnostics.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     failed = [record for record in records if record["check_target_rc"] != 0 or record["exec_plan_rc"] != 0]

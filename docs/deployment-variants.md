@@ -1,46 +1,38 @@
-# Deployment Variants
+# 部署路线
 
-The Android app has two physically separated deployment flavors.
+## 当前路线 1：ONNX Demo
 
-## ONNX Demo
+- Source set：`app/src/onnxDemo/`
+- 神经网络运行时：ONNX Runtime
+- 模型：`models/onnx-demo/assets/models/*.onnx`
+- 构建：`./gradlew :app:assembleOnnxDemoDebug`
+- Application ID：`com.gvcrt.clean.onnxdemo`
 
-- Source set: `app/src/onnxDemo/`
-- Neural runtime: ONNX Runtime
-- Models: `app/src/onnxDemo/assets/models/*.onnx`
-- Canonical manifest: `app/src/onnxDemo/assets/gvcrt_clean_manifest.json`
-- Build: `./gradlew :app:assembleOnnxDemoDebug`
-- Application ID: `com.gvcrt.clean.onnxdemo`
+该路线用于图片重建、PSNR、码流回环和模块演示。rANS 使用共享原生实现。
 
-This flavor is the stable demonstration path for image reconstruction, PSNR,
-bitstream round trips, and module timing. Native rANS remains shared code.
+## 当前路线 2：MTK 在线部署（Large / Small）
 
-## MTK Offline
+- Source set：`app/src/mtkOffline/`
+- 神经网络运行时：TFLite + MediaTek 官方 `NeuronDelegate`
+- 构建：`./gradlew :app:assembleMtkOfflineDebug`
+- Application ID：`com.gvcrt.clean.mtkoffline`
 
-- Source set: `app/src/mtkOffline/`
-- Neural runtime: MediaTek offline DLA runtime
-- Final models: `app/src/mtkOffline/assets/offline_models/*.dla`
-- Conversion-only inputs: `app/src/mtkOffline/conversion_inputs/`
-- Build: `./gradlew :app:assembleMtkOfflineDebug`
-- Application ID: `com.gvcrt.clean.mtkoffline`
+Large 与 Small 均使用同一 APK；模型包位于独立的本地模型分支，位置见 [模型索引](../models/README.md)。设备按下表从应用私有目录或 external files 目录读取对应包内的 `models/*.tflite`，再由 `NeuronDelegate` 在线编译。
 
-TFLite and ONNX conversion diagnostics stay under `conversion_inputs/` and are
-not packaged into the APK. The final deployment path must load compiled `.dla`
-models and must not fall back to ONNX, TFLite online compilation, NNAPI, or CPU
-neural inference.
+| 模型变体 | 交付包目录 | 设备目录 | 测试参数 |
+| --- | --- | --- | --- |
+| Large | `models/large/local_models/gvc-rt-large/` | `enterprise_tflite/large/` | `enterpriseTfliteVariant=large` |
+| Small | `models/small/local_models/gvc-rt-small/` | `enterprise_tflite/small/` | `enterpriseTfliteVariant=small` |
 
-Common Kotlin, JNI, rANS, baselines, and sample images remain in `app/src/main/`.
+也可使用 `enterpriseTfliteVariant=all` 依次检查两个变体。`mtkOffline` 是历史 source set 名称，不表示当前加载 `.dla`。
 
-## Server Offline Export
+## 后续路线：MTK 离线 DLA
 
-Upload the current exporters and run:
+服务器脚本可生成 NCC 验证的 `.dla` 企业交付物：
 
 ```bash
 cd /media/ltelab/D/weilingfeng/GVC-RT_clean_android
 bash server_tools/run_mtk_offline_export.sh
 ```
 
-The script publishes only NCC-verified `.dla` files to
-`app/src/mtkOffline/assets/offline_models/`. TFLite, TorchScript, logs, and
-failed candidates remain under `outputs/` and are not packaged into the APK.
-The published manifests deliberately keep `precision_verified=false` until a
-separate server tensor comparison has passed.
+该路线是后续企业离线集成方向，当前 Android 应用不加载 `.dla`。转换日志、TFLite、TorchScript 和失败候选均留在 `outputs/`，不打入 APK。

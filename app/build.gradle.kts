@@ -52,7 +52,9 @@ android {
             }
         }
         getByName("onnxDemo") {
-            assets.srcDir("src/onnxDemo/assets")
+            if (!project.hasProperty("gvcrtSkipAssets")) {
+                assets.srcDir(rootProject.file("models/onnx-demo/assets"))
+            }
         }
         getByName("mtkOffline") {
             if (project.hasProperty("gvcrtSkipAssets")) {

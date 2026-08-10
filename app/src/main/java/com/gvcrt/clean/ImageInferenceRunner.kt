@@ -145,6 +145,122 @@ class ImageInferenceRunner(
         emit("image_inference_status=PASS")
     }
 
+    fun runSequence(sequenceDir: String, frameCount: Int = 96) {
+        require(frameCount > 0) { "sequence frame count must be positive" }
+        val directory = File(sequenceDir)
+        require(directory.isDirectory) { "sequence directory does not exist: ${directory.absolutePath}" }
+        val frames = directory.listFiles()
+            ?.filter { it.isFile && it.extension.equals("png", ignoreCase = true) }
+            ?.sortedBy { it.name }
+            ?.take(frameCount)
+            .orEmpty()
+        require(frames.size == frameCount) {
+            "sequence requires $frameCount PNG frames, found ${frames.size} in ${directory.absolutePath}"
+        }
+
+        val encoder = manifest.modules["complete_encoder"]?.singleOrNull()
+            ?: error("missing image inference encoder case")
+        val steps = encoder.steps.associateBy(GraphStep::name)
+        val iSteps = I_SEQUENCE_STEPS.map(steps::getValue)
+        val pSteps = P_SEQUENCE_STEPS.map(steps::getValue)
+        val fromFrame = steps.getValue("p_temporal_from_i_reference_frame")
+        val fromFeature = manifest.modules["temporal_reference"]
+            ?.singleOrNull { it.name == "from_feature" }
+            ?.steps
+            ?.singleOrNull()
+            ?: error("missing temporal from-feature step")
+        val iEntropy = manifest.entropy["i"] ?: error("missing I rANS assets")
+        val pEntropy = manifest.entropy["p"] ?: error("missing P rANS assets")
+        val iRans = createRansEncoder(iEntropy)
+        val pRans = createRansEncoder(pEntropy)
+        val coreSamples = ArrayList<Long>(frameCount)
+        val psnrSamples = ArrayList<Double>(frameCount)
+        var totalPayloadBytes = 0L
+        var referenceFrame: TensorValue? = null
+        var referenceFeature: TensorValue? = null
+
+        emit(
+            "sequence_inference_start directory=${directory.absolutePath} frames=$frameCount " +
+                "backend=${backend.label} precision=${manifest.metadata.optString("precision")}"
+        )
+        val prepareStart = SystemClock.elapsedRealtimeNanos()
+        runner.prepare((iSteps + fromFrame + fromFeature + pSteps).distinctBy(GraphStep::model))
+        emit("sequence_session_prepare_ms=${formatMs(SystemClock.elapsedRealtimeNanos() - prepareStart)}")
+
+        try {
+            frames.forEachIndexed { index, frame ->
+                val image = ImageTensorLoader.load(context, frame.absolutePath)
+                val timer = StageTimer()
+                val started = SystemClock.elapsedRealtimeNanos()
+                val tensors = linkedMapOf<String, TensorValue>()
+                val payload: ByteArray
+                val reconstruction: TensorValue
+                if (index == 0) {
+                    val input = image.tensor.renamed("input_i_frame")
+                    val staticInputs = mapOf(input.name to input)
+                    iSteps.forEach { step ->
+                        tensors.putAll(runGraphStep(runner, step, tensors, timer, staticInputs))
+                    }
+                    payload = encodeEntropy("i", iEntropy, tensors, 4, iRans, timer)
+                    reconstruction = tensors.getValue("encoder_i_reference_frame")
+                    referenceFrame = reconstruction
+                } else {
+                    if (index == 1) {
+                        tensors["encoder_i_reference_frame"] =
+                            referenceFrame ?: error("missing I reference frame")
+                        tensors.putAll(runGraphStep(runner, fromFrame, tensors, timer))
+                    } else {
+                        val feature = referenceFeature ?: error("missing P reference feature")
+                        val temporal = timer.measure(fromFeature.name) {
+                            runner.run(
+                                fromFeature,
+                                mapOf("reference_feature" to feature.renamed("reference_feature")),
+                            )
+                        }
+                        tensors.putAll(temporal)
+                        tensors["p_ctx"] = temporal.getValue("p_ctx_from_feature").renamed("p_ctx")
+                        tensors["p_ctx_t"] = temporal.getValue("p_ctx_t_from_feature").renamed("p_ctx_t")
+                    }
+                    val input = image.tensor.renamed("input_p_frame")
+                    val staticInputs = mapOf(input.name to input)
+                    pSteps.forEach { step ->
+                        tensors.putAll(runGraphStep(runner, step, tensors, timer, staticInputs))
+                    }
+                    payload = encodeEntropy("p", pEntropy, tensors, 2, pRans, timer)
+                    reconstruction = tensors.getValue("encoder_p_reference_frame")
+                    referenceFeature = tensors.getValue("encoder_p_reference_feature")
+                }
+                val coreNs = SystemClock.elapsedRealtimeNanos() - started
+                val psnr = calculatePsnr(image.tensor, reconstruction)
+                coreSamples += coreNs
+                psnrSamples += psnr
+                totalPayloadBytes += payload.size
+                emit(
+                    "sequence_frame index=${index + 1} type=${if (index == 0) "I" else "P"} " +
+                        "file=${frame.name} core_ms=${formatMs(coreNs)} payload_bytes=${payload.size} " +
+                        "psnr_db=${formatFloat(psnr)}"
+                )
+            }
+        } finally {
+            iRans.close()
+            pRans.close()
+        }
+
+        val sortedCore = coreSamples.sorted()
+        val totalCoreNs = coreSamples.sum()
+        val meanNs = totalCoreNs / frameCount
+        emit(
+            "sequence_summary frames=$frameCount i_frames=1 p_frames=${frameCount - 1} " +
+                "mean_ms=${formatMs(meanNs)} p50_ms=${formatMs(percentile(sortedCore, 0.50))} " +
+                "p90_ms=${formatMs(percentile(sortedCore, 0.90))} " +
+                "fps=${formatFloat(1_000_000_000.0 / meanNs.coerceAtLeast(1L))} " +
+                "mean_psnr_db=${formatFloat(psnrSamples.average())} " +
+                "min_psnr_db=${formatFloat(psnrSamples.minOrNull() ?: Double.NaN)} " +
+                "payload_bytes=$totalPayloadBytes"
+        )
+        emit("sequence_inference_status=PASS")
+    }
+
     override fun close() {
         // The process cache owns the runner so Activity recreation keeps sessions warm.
     }
@@ -316,6 +432,19 @@ class ImageInferenceRunner(
         return psnr
     }
 
+    private fun calculatePsnr(input: TensorValue, reconstruction: TensorValue): Double {
+        require(input.data.size == reconstruction.data.size) {
+            "PSNR element mismatch: ${input.data.size} vs ${reconstruction.data.size}"
+        }
+        var sumSq = 0.0
+        for (index in input.data.indices) {
+            val diff = reconstruction.data[index].toDisplayRange() - input.data[index].toDisplayRange()
+            sumSq += diff * diff
+        }
+        val rmse = sqrt(sumSq / input.data.size.coerceAtLeast(1))
+        return if (rmse == 0.0) Double.POSITIVE_INFINITY else 20.0 * log10(1.0 / rmse)
+    }
+
     private fun emitRoundTripComparison(label: String, encoded: TensorValue, decoded: TensorValue) {
         val diff = TensorIO.diff(encoded, decoded)
         emit(
@@ -354,8 +483,6 @@ class ImageInferenceRunner(
         return file
     }
 
-    private fun TensorValue.renamed(name: String): TensorValue = TensorValue(name, shape, data)
-
     private fun Float.toDisplayRange(): Double =
         (((coerceIn(-1.0f, 1.0f) + 1.0f) * 0.5f).toDouble()).coerceIn(0.0, 1.0)
 
@@ -365,6 +492,12 @@ class ImageInferenceRunner(
     private fun formatFloat(value: Double): String = String.format(Locale.US, "%.6f", value)
 
     private fun formatMs(nanos: Long): String = String.format(Locale.US, "%.3f", nanos / 1_000_000.0)
+
+    private fun percentile(sorted: List<Long>, fraction: Double): Long {
+        if (sorted.isEmpty()) return 0L
+        val index = ((sorted.size - 1) * fraction).toInt().coerceIn(sorted.indices)
+        return sorted[index]
+    }
 
     private fun LongArray.elementCount(): Int = fold(1L) { acc, value -> acc * value }.toInt()
 
@@ -383,5 +516,19 @@ class ImageInferenceRunner(
 
     companion object {
         private const val MANIFEST = "gvcrt_clean_manifest.json"
+        private val I_SEQUENCE_STEPS = listOf(
+            "i_encoder_front",
+            "i_hyper_enc",
+            "i_hyper_prior",
+            "i_prior_4x",
+            "i_recon",
+        )
+        private val P_SEQUENCE_STEPS = listOf(
+            "p_encoder_front",
+            "p_hyper_enc",
+            "p_hyper_prior",
+            "p_prior_2x",
+            "p_recon",
+        )
     }
 }

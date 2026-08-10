@@ -61,21 +61,6 @@ class MainActivity : Activity() {
         val imageInferenceButton = moduleButton("Image\ninfer") {
             startTests(listOf("image_inference"))
         }
-        val reconMnnButton = moduleButton("Recon\nMNN") {
-            startTests(listOf("recon_mnn_diagnostic"))
-        }
-        val priorNpuPrecisionButton = moduleButton("I Prior\nprecision") {
-            startTests(listOf("i_prior_npu_precision"))
-        }
-        val priorNpuSpeedButton = moduleButton("I Prior\nNPU speed") {
-            startTests(listOf("i_prior_npu_speed"))
-        }
-        val priorTfliteProbeButton = moduleButton("I Prior\nTFLite probe") {
-            startTests(listOf("i_prior_tflite_probe"))
-        }
-        val pPriorTfliteProbeButton = moduleButton("P Prior\nTFLite probe") {
-            startTests(listOf("p_prior_tflite_probe"))
-        }
         moduleButtons = buildList {
             addAll(
                 listOf(
@@ -89,17 +74,6 @@ class MainActivity : Activity() {
                     imageInferenceButton,
                 )
             )
-            if (!isOnnxDemo) {
-                addAll(
-                    listOf(
-                        reconMnnButton,
-                        priorNpuPrecisionButton,
-                        priorNpuSpeedButton,
-                        priorTfliteProbeButton,
-                        pPriorTfliteProbeButton,
-                    )
-                )
-            }
         }
 
         val controls = LinearLayout(this).apply {
@@ -124,18 +98,6 @@ class MainActivity : Activity() {
             setPadding(16, 0, 16, 0)
             addView(fullProjectButton, buttonLayoutParams())
             addView(imageInferenceButton, buttonLayoutParams())
-            if (!isOnnxDemo) {
-                addView(reconMnnButton, buttonLayoutParams())
-            }
-        }
-        val priorNpuControls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(16, 0, 16, 0)
-            addView(priorNpuPrecisionButton, buttonLayoutParams())
-            addView(priorNpuSpeedButton, buttonLayoutParams())
-            addView(priorTfliteProbeButton, buttonLayoutParams())
-            addView(pPriorTfliteProbeButton, buttonLayoutParams())
         }
         inputImage = comparisonImageView()
         reconImage = comparisonImageView()
@@ -158,9 +120,6 @@ class MainActivity : Activity() {
             addView(controls)
             addView(speedControls)
             addView(projectControls)
-            if (!isOnnxDemo) {
-                addView(priorNpuControls)
-            }
             addView(
                 imageComparison,
                 LinearLayout.LayoutParams(
@@ -211,19 +170,14 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("completeDecoderSpeedTest", false) -> listOf("complete_decoder_speed")
             intent.getBooleanExtra("fullProjectTest", false) -> FULL_PROJECT_MODULES
             intent.getBooleanExtra("imageInferenceTest", false) -> listOf("image_inference")
-            intent.getBooleanExtra("reconDiagnosticTest", false) -> listOf("recon_diagnostic")
-            intent.getBooleanExtra("reconDissectTest", false) -> listOf("recon_dissect")
-            intent.getBooleanExtra("iLatentOp0Fp16PrecisionTest", false) -> listOf("i_latent_op0_fp16")
-            intent.getBooleanExtra("iLatentOp0AdapterFp16Test", false) -> listOf("i_latent_op0_adapter_fp16")
-            intent.getBooleanExtra("iLatentConvInOfficialNeuronTest", false) -> listOf("i_latent_conv_in_official")
-            intent.getBooleanExtra("iFeatureDecOfficialNeuronTest", false) -> listOf("i_featuredec_official")
-            intent.getBooleanExtra("iFeatureDecSplitOfficialNeuronTest", false) -> listOf("i_featuredec_split_official")
-            intent.getBooleanExtra("iReconOfficialNeuronTest", false) -> listOf("i_recon_official")
-            intent.getBooleanExtra("reconMnnDiagnosticTest", false) -> listOf("recon_mnn_diagnostic")
-            intent.getBooleanExtra("iPriorNpuPrecisionTest", false) -> listOf("i_prior_npu_precision")
-            intent.getBooleanExtra("iPriorNpuSpeedTest", false) -> listOf("i_prior_npu_speed")
-            intent.getBooleanExtra("iPriorTfliteProbe", false) -> listOf("i_prior_tflite_probe")
-            intent.getBooleanExtra("pPriorTfliteProbe", false) -> listOf("p_prior_tflite_probe")
+            intent.getBooleanExtra("sequenceInferenceTest", false) -> listOf("sequence_inference")
+            intent.getBooleanExtra("largeIpEntropyCodecTest", false) ->
+                listOf("large_i_entropy_codec", "large_p_entropy_codec")
+            intent.getBooleanExtra("largeIEntropyNhwcTest", false) -> listOf("large_i_entropy_nhwc")
+            intent.getBooleanExtra("largeIEntropyMergedTest", false) -> listOf("large_i_entropy_merged")
+            intent.getBooleanExtra("largeIEntropyCodecTest", false) -> listOf("large_i_entropy_codec")
+            intent.getBooleanExtra("largeIEntropyCpu4Test", false) -> listOf("large_i_entropy_cpu4")
+            intent.getBooleanExtra("largePEntropyCodecTest", false) -> listOf("large_p_entropy_codec")
             intent.getBooleanExtra("enterpriseTfliteTest", false) -> listOf("enterprise_tflite")
             else -> emptyList()
         }
@@ -335,82 +289,12 @@ class MainActivity : Activity() {
                                 decodeFromBitstream = intent.getBooleanExtra("imageInferenceDecodeBitstream", true),
                             )
                         }
-                        moduleName == "recon_diagnostic" -> {
-                            ReconDiagnosticBenchmark(this, ::emit).run(
-                                labelFilter = intent.getStringExtra("reconDiagLabel"),
-                                createOnly = intent.getBooleanExtra("reconDiagCreateOnly", false),
-                                copyOutputs = !intent.getBooleanExtra("reconDiagNoOutputCopy", false),
-                                accelerationMode = intent.getIntExtra(
-                                    "reconDiagAccelerationMode",
-                                    MtkTfliteRuntime.ACCELERATION_NEURON,
-                                ),
-                                warmupRuns = intent.getIntExtra("reconDiagWarmup", 5),
-                                measuredRuns = intent.getIntExtra("reconDiagMeasured", 20),
+                        moduleName == "sequence_inference" -> {
+                            imageRunnerFor(OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK, ::emit).runSequence(
+                                sequenceDir = intent.getStringExtra("sequenceDir")
+                                    ?: error("sequenceInferenceTest requires sequenceDir"),
+                                frameCount = intent.getIntExtra("sequenceFrames", 96),
                             )
-                        }
-                        moduleName == "recon_dissect" -> {
-                            OnlineCompileDissectionProbe(this, ::emit).run(
-                                opName = intent.getStringExtra("reconDissectOp"),
-                                accelerationMode = if (intent.getBooleanExtra("reconDissectCpu", false)) {
-                                    MtkTfliteRuntime.ACCELERATION_CPU
-                                } else {
-                                    MtkTfliteRuntime.ACCELERATION_NEURON
-                                },
-                                useOfficialNeuronDelegate = intent.getBooleanExtra("reconDissectOfficialNeuron", false),
-                                officialAllowFp16ForFp32 = !intent.getBooleanExtra("reconDissectOfficialFp32", false),
-                            )
-                        }
-                        moduleName == "i_latent_op0_fp16" -> {
-                            ILatentOp0Fp16Probe(this, ::emit).run(
-                                accelerationMode = if (intent.getBooleanExtra("iLatentOp0Fp16Cpu", false)) {
-                                    MtkTfliteRuntime.ACCELERATION_CPU
-                                } else {
-                                    MtkTfliteRuntime.ACCELERATION_NEURON
-                                },
-                            )
-                        }
-                        moduleName == "i_latent_op0_adapter_fp16" -> {
-                            ILatentOp0NeuronAdapterProbe(this, ::emit).run()
-                        }
-                        moduleName == "i_latent_conv_in_official" -> {
-                            ILatentConvInOfficialNeuronProbe(this, ::emit).run()
-                        }
-                        moduleName == "i_featuredec_official" -> {
-                            IFeatureDecOfficialNeuronProbe(this, ::emit).run(
-                                warmupRuns = intent.getIntExtra("iFeatureDecWarmup", 3),
-                                measuredRuns = intent.getIntExtra("iFeatureDecMeasured", 10),
-                            )
-                        }
-                        moduleName == "i_featuredec_split_official" -> {
-                            IFeatureDecSplitOfficialNeuronProbe(this, ::emit).run(
-                                warmupRuns = intent.getIntExtra("iFeatureDecWarmup", 3),
-                                measuredRuns = intent.getIntExtra("iFeatureDecMeasured", 10),
-                            )
-                        }
-                        moduleName == "i_recon_official" -> {
-                            IReconOfficialNeuronProbe(this, ::emit).run()
-                        }
-                        moduleName == "recon_mnn_diagnostic" -> {
-                            MnnReconDiagnosticBenchmark(this, ::emit).run(
-                                labelFilter = intent.getStringExtra("reconMnnLabel"),
-                                warmupRuns = intent.getIntExtra("reconMnnWarmup", 5),
-                                measuredRuns = intent.getIntExtra("reconMnnMeasured", 20),
-                            )
-                        }
-                        moduleName == "i_prior_npu_precision" -> {
-                            IEncoderPriorTfliteDiagnostic(this, ::emit).runPrecision()
-                        }
-                        moduleName == "i_prior_npu_speed" -> {
-                            IEncoderPriorTfliteDiagnostic(this, ::emit).runSpeed(
-                                warmupRuns = intent.getIntExtra("iPriorNpuWarmup", 5),
-                                measuredRuns = intent.getIntExtra("iPriorNpuMeasured", 50),
-                            )
-                        }
-                        moduleName == "i_prior_tflite_probe" -> {
-                            IEncoderPriorTfliteDiagnostic(this, ::emit).run()
-                        }
-                        moduleName == "p_prior_tflite_probe" -> {
-                            PEncoderPriorTfliteDiagnostic(this, ::emit).run()
                         }
                         moduleName == "enterprise_tflite" -> {
                             EnterpriseTfliteCompatibilityProbe(this, ::emit).run(
@@ -420,12 +304,47 @@ class MainActivity : Activity() {
                                 relaxFp32 = intent.getBooleanExtra("enterpriseTfliteRelaxFp32", false),
                             )
                         }
+                        moduleName == "large_i_entropy_codec" -> {
+                            LargeIEntropyCodecProbe(this, ::emit).run()
+                        }
+                        moduleName == "large_i_entropy_nhwc" -> {
+                            LargeIEntropyCodecProbe(this, ::emit).run(useNhwcEntropy = true)
+                        }
+                        moduleName == "large_i_entropy_merged" -> {
+                            LargeIEntropyCodecProbe(this, ::emit).run(
+                                useMergedEntropy = true,
+                                compareMergedAgainstNhwc = intent.getBooleanExtra(
+                                    "largeIEntropyMergedCompareSplit",
+                                    true,
+                                ),
+                                mergedWarmupRuns = intent.getIntExtra("largeIEntropyMergedWarmup", 3),
+                                mergedMeasuredRuns = intent.getIntExtra("largeIEntropyMergedMeasured", 10),
+                            )
+                        }
+                        moduleName == "large_i_entropy_cpu4" -> {
+                            LargeIEntropyCpu4Benchmark(this, ::emit).run(
+                                warmupRuns = intent.getIntExtra("largeIEntropyCpu4Warmup", 3),
+                                measuredRuns = intent.getIntExtra("largeIEntropyCpu4Measured", 10),
+                            )
+                        }
+                        moduleName == "large_p_entropy_codec" -> {
+                            LargePEntropyCodecProbe(this, ::emit).run()
+                        }
                         moduleName.endsWith("_speed") -> {
+                            val speedBackend = if (
+                                intent.getBooleanExtra("speedNnapiCpuDisabled", false)
+                            ) {
+                                OnnxBackend.NNAPI_FP16_CPU_DISABLED
+                            } else {
+                                OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK
+                            }
                             ModuleSpeedBenchmarks(
                                 this,
                                 ::emit,
+                                backend = speedBackend,
                                 warmupRuns = intent.getIntExtra("speedWarmup", 5),
                                 measuredRuns = intent.getIntExtra("speedMeasured", 50),
+                                enableProfiling = intent.getBooleanExtra("onnxProfiling", false),
                             ).runModule(moduleName.removeSuffix("_speed"))
                         }
                         else -> {
@@ -532,6 +451,7 @@ class MainActivity : Activity() {
             "complete_encoder_speed",
             "complete_decoder_speed",
             "image_inference",
+            "sequence_inference",
         )
         private val FULL_PROJECT_MODULES = listOf(
             "temporal_reference",

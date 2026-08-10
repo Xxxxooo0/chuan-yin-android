@@ -19,7 +19,7 @@ import torch
 from torch import nn
 
 from analyze_recon_neuron_support import find_ncc
-from export_recon_diagnostic import PROJECT_ROOT, find_tool, load_i_model, load_p_model, sha256
+from gvcrt_export_common import PROJECT_ROOT, find_tool, load_i_model, load_p_model, sha256
 from export_three_modules_offline_nhwc import Candidate, export_candidate, write_manifest
 
 

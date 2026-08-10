@@ -11,6 +11,7 @@ class ModuleSpeedBenchmarks(
     private val backend: OnnxBackend = OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK,
     private val warmupRuns: Int = DEFAULT_WARMUP_RUNS,
     private val measuredRuns: Int = DEFAULT_MEASURED_RUNS,
+    private val enableProfiling: Boolean = false,
 ) {
     private val store = AssetStore(context)
     private val manifest = CleanManifest.parse(store.readBytes(MANIFEST).decodeToString())
@@ -33,7 +34,7 @@ class ModuleSpeedBenchmarks(
 
     private fun runTemporalReference() {
         val cases = manifest.modules["temporal_reference"] ?: error("missing temporal reference cases")
-        OnnxSessionRunner(store, backend).use { runner ->
+        createRunner("temporal_reference").use { runner ->
             cases.forEach { case ->
                 val staticInputs = preloadStaticInputs(case.steps)
                 benchmark("temporal_reference_${case.name}", 1) { timer ->
@@ -53,7 +54,7 @@ class ModuleSpeedBenchmarks(
         val iRans = createRansEncoder(iEntropy)
         val pRans = createRansEncoder(pEntropy)
         try {
-            OnnxSessionRunner(store, backend).use { runner ->
+            createRunner("complete_encoder").use { runner ->
                 benchmark("complete_encoder", 2) { timer ->
                     val tensors = runGraphSteps(runner, case.steps, staticInputs, timer)
                     val iPayload = encodeEntropy("i", iEntropy, tensors, 4, iRans, timer)
@@ -85,7 +86,7 @@ class ModuleSpeedBenchmarks(
         val iRans = createRans(iEntropy)
         val pRans = createRans(pEntropy)
         try {
-            OnnxSessionRunner(store, backend).use { runner ->
+            createRunner("complete_decoder").use { runner ->
                 benchmark("complete_decoder", 2) { timer ->
                     val parsed = timer.measure("stream_parse") { GvcStreamMuxer.demux(streamBytes) }
                     require(parsed.stream.height == expectedStream.height && parsed.stream.width == expectedStream.width) {
@@ -250,6 +251,18 @@ class ModuleSpeedBenchmarks(
                 "mean_ms=${formatMs(summary.meanNs)} p50_ms=${formatMs(summary.p50Ns)} p90_ms=${formatMs(summary.p90Ns)}" +
                 (fps?.let { " fps=${String.format(Locale.US, "%.3f", it)}" } ?: "")
         )
+    }
+
+    private fun createRunner(label: String): OnnxSessionRunner {
+        val profileDir = if (enableProfiling) {
+            java.io.File(context.filesDir, "ort_profiles/$label").apply { mkdirs() }
+        } else {
+            null
+        }
+        if (profileDir != null) {
+            emit("onnx_profile_enabled label=$label directory=${profileDir.absolutePath}")
+        }
+        return OnnxSessionRunner(store, backend, profileDir, emit)
     }
 
     private fun formatMs(nanos: Double): String = String.format(Locale.US, "%.3f", nanos / 1_000_000.0)

@@ -133,14 +133,13 @@ class VectorWriter:
         self.root.mkdir(parents=True, exist_ok=True)
         manifest_path = self.root / "precision_manifest.json"
         manifest_path.write_text(json.dumps(self.manifest, indent=2), encoding="utf-8")
-        readme = """# Enterprise DLA Precision Vectors
+        readme = """# 企业 DLA 精度向量
 
-Run stages in precision_manifest.json order. All tensors are NHWC, little-endian
-FP32. Write each DLA output under vendor_outputs/ using its vendor_file path.
-Use compare_outputs.py for comparison.
+按 `precision_manifest.json` 中的顺序运行各 stage。所有 Tensor 均为 NHWC、
+小端 FP32。每个 DLA 输出必须按 `vendor_file` 指定的路径写入
+`vendor_outputs/`，随后使用 `compare_outputs.py` 生成对比结果。
 
-The vectors validate the direct-latent reconstruction boundary. They do not
-contain an entropy model, entropy coder, or bitstream.
+该向量验证直接 latent 重建边界。
 """
         (self.root / "README.md").write_text(readme, encoding="utf-8")
         compare_source = Path(__file__).with_name("compare_enterprise_precision_outputs.py")
@@ -232,7 +231,7 @@ def export_small(args: argparse.Namespace, writer: VectorWriter) -> None:
 def export_large(args: argparse.Namespace, writer: VectorWriter) -> None:
     from export_clean_gvcrt_modules import TemporalFromFeature
     from export_decoder_full_norm_rewrite_nhwc import IFullSynthesisNhwc, PFullSynthesisNhwc
-    from export_recon_diagnostic import load_i_model, load_p_model
+    from gvcrt_export_common import load_i_model, load_p_model
     from export_three_modules_offline_nhwc import (
         IEncoderDirectNhwc,
         NhwcBoundary,

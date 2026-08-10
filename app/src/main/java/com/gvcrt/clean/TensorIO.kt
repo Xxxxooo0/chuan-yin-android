@@ -4,12 +4,42 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.sqrt
 
-data class TensorValue(
+class TensorValue private constructor(
     val name: String,
     val shape: LongArray,
-    val data: FloatArray,
+    private var floatStorage: FloatArray?,
+    private val halfStorage: ShortArray?,
 ) {
-    val numel: Int get() = data.size
+    constructor(name: String, shape: LongArray, data: FloatArray) :
+        this(name, shape, data, null)
+
+    val data: FloatArray
+        get() = floatStorage ?: FloatArray(halfStorage!!.size) {
+            TensorIO.halfBitsToFloat(halfStorage[it])
+        }.also { floatStorage = it }
+
+    val numel: Int get() = floatStorage?.size ?: halfStorage!!.size
+
+    fun fp16Bits(): ShortArray {
+        val floats = floatStorage
+        return if (floats == null) {
+            halfStorage!!
+        } else {
+            ShortArray(floats.size) { TensorIO.floatToHalfBits(floats[it]) }
+        }
+    }
+
+    fun renamed(newName: String): TensorValue =
+        if (floatStorage == null) {
+            fromFp16(newName, shape, halfStorage!!)
+        } else {
+            TensorValue(newName, shape, floatStorage!!)
+        }
+
+    companion object {
+        fun fromFp16(name: String, shape: LongArray, data: ShortArray): TensorValue =
+            TensorValue(name, shape, null, data)
+    }
 }
 
 data class TensorDiff(

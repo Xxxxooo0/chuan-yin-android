@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from analyze_recon_neuron_support import analyze_one, find_ncc
-from export_recon_diagnostic import (
+from gvcrt_export_common import (
     PROJECT_ROOT,
     ExplicitDepthConvBlock,
     find_tool,
