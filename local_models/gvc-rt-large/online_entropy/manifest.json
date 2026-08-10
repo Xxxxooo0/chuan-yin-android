@@ -1,0 +1,27 @@
+{
+  "name": "i_entropy_prior_merged",
+  "file": "i_entropy_prior_merged.tflite",
+  "sha256": "a9f2c9f597f70e2dc609ce191a33b3281b07a71ba80c15b768993af5d147c673",
+  "packaging": "standalone_not_in_codec_archive",
+  "fixed_profile": {
+    "frame_size": [256, 512],
+    "qp": 0,
+    "layout": "NHWC",
+    "dtype": "FP32 external I/O"
+  },
+  "inputs": [
+    {"name": "i_y_pre_prior", "shape": [1, 16, 32, 256]}
+  ],
+  "outputs": [
+    {"name": "i_z_hat", "shape": [1, 4, 8, 128]},
+    {"name": "i_y_q_w_0", "shape": [1, 16, 32, 64]},
+    {"name": "i_y_q_w_1", "shape": [1, 16, 32, 64]},
+    {"name": "i_y_q_w_2", "shape": [1, 16, 32, 64]},
+    {"name": "i_y_q_w_3", "shape": [1, 16, 32, 64]},
+    {"name": "i_s_w_0", "shape": [1, 16, 32, 64]},
+    {"name": "i_s_w_1", "shape": [1, 16, 32, 64]},
+    {"name": "i_s_w_2", "shape": [1, 16, 32, 64]},
+    {"name": "i_s_w_3", "shape": [1, 16, 32, 64]},
+    {"name": "i_y_hat", "shape": [1, 16, 32, 256]}
+  ]
+}
