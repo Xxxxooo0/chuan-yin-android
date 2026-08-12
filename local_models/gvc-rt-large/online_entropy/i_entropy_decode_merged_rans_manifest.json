@@ -1,0 +1,128 @@
+{
+  "name": "i_entropy_decode_merged_rans",
+  "file": "i_entropy_decode_merged_rans.tflite",
+  "sha256": "6d6313c13af3bde00b57709f12f5b6128e09ce63227de0e7a6e678a0757fdbc1",
+  "source_model": "/media/ltelab/D/weilingfeng/GVC-RT_clean_android/outputs/i_entropy_decoder_merged_nhwc/i_entropy_decode_merged_base_fp32.tflite",
+  "source_sha256": "e718514f32f756acbebe964ed8e9eaf85d37abf79807097b61182b94c217daf4",
+  "custom_ops": [
+    "GVC_RT_RANS_DECODE_Z",
+    "GVC_RT_RANS_DECODE_Y"
+  ],
+  "custom_op_backend": "CPU",
+  "input_names": [
+    "i_rans_payload_buffer",
+    "i_rans_payload_size"
+  ],
+  "input_shapes": [
+    [
+      262144
+    ],
+    [
+      1
+    ]
+  ],
+  "output_names": [
+    "i_z_hat",
+    "i_y_q_w_0",
+    "i_y_q_w_1",
+    "i_y_q_w_2",
+    "i_y_q_w_3",
+    "i_s_w_0",
+    "i_s_w_1",
+    "i_s_w_2",
+    "i_s_w_3",
+    "i_y_hat"
+  ],
+  "output_shapes_nhwc": [
+    [
+      1,
+      4,
+      8,
+      128
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      256
+    ]
+  ],
+  "payload_capacity_bytes": 262144,
+  "z_start_offset": 0,
+  "z_per_channel_size": 32,
+  "cdf_embedded": true,
+  "decode_insertions": [
+    {
+      "stage": 0,
+      "operator_position": 117,
+      "scale_tensor": "49",
+      "decoded_tensor": "tensor0.1"
+    },
+    {
+      "stage": 1,
+      "operator_position": 194,
+      "scale_tensor": "52",
+      "decoded_tensor": "tensor1.1"
+    },
+    {
+      "stage": 2,
+      "operator_position": 272,
+      "scale_tensor": "55",
+      "decoded_tensor": "tensor2.1"
+    },
+    {
+      "stage": 3,
+      "operator_position": 350,
+      "scale_tensor": "58",
+      "decoded_tensor": "tensor3.1"
+    }
+  ]
+}

@@ -1,0 +1,95 @@
+{
+  "name": "p_entropy_decode_merged_rans",
+  "file": "p_entropy_decode_merged_rans.tflite",
+  "sha256": "d7f32eae5b9da8f972a2d9f3059d3908ff7a756e52384b1d35e33c2825ab078f",
+  "source_model": "/media/ltelab/D/weilingfeng/GVC-RT_clean_android/outputs/p_entropy_decoder_merged_nhwc/p_entropy_decode_merged_base_fp32.tflite",
+  "source_sha256": "368af308b963e7da7ba19fb26da97d3088160037bde95d9f77c6cff76d0e3fa0",
+  "custom_ops": [
+    "GVC_RT_P_RANS_DECODE_Z",
+    "GVC_RT_P_RANS_DECODE_Y"
+  ],
+  "custom_op_backend": "CPU",
+  "input_names": [
+    "p_rans_payload_buffer",
+    "p_rans_payload_size",
+    "p_ctx_t"
+  ],
+  "input_shapes": [
+    [
+      262144
+    ],
+    [
+      1
+    ],
+    [
+      1,
+      32,
+      64,
+      256
+    ]
+  ],
+  "output_names": [
+    "p_z_hat",
+    "p_y_q_w_0",
+    "p_y_q_w_1",
+    "p_s_w_0",
+    "p_s_w_1",
+    "p_y_hat"
+  ],
+  "output_shapes_nhwc": [
+    [
+      1,
+      4,
+      8,
+      128
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      64
+    ],
+    [
+      1,
+      16,
+      32,
+      128
+    ]
+  ],
+  "payload_capacity_bytes": 262144,
+  "z_start_offset": 0,
+  "z_per_channel_size": 32,
+  "cdf_embedded": true,
+  "decode_insertions": [
+    {
+      "stage": 0,
+      "operator_position": 123,
+      "scale_tensor": "37",
+      "decoded_tensor": "tensor0.1"
+    },
+    {
+      "stage": 1,
+      "operator_position": 166,
+      "scale_tensor": "40",
+      "decoded_tensor": "tensor1.1"
+    }
+  ]
+}
