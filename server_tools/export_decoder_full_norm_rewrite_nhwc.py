@@ -78,6 +78,12 @@ class FixedGroupNorm(nn.Module):
         self.reduce_channels.weight.requires_grad_(False)
         self.expand_channels.weight.requires_grad_(False)
         self.eps = float(source.eps)
+        # High-resolution decoder blocks can reach |x| > 1,300. Squaring that
+        # directly overflows FP16 before the reduction. A power-of-two scale
+        # keeps the variance path finite while preserving the normalization:
+        #   (s*x) / sqrt(E[(s*x)^2] + eps*s^2) == x / sqrt(E[x^2] + eps)
+        self.variance_scale = 1.0 / 16.0 if height >= 32 or width >= 64 else 1.0
+        self.scaled_eps = self.eps * self.variance_scale * self.variance_scale
         if source.affine:
             self.register_buffer("affine_weight", source.weight.detach().reshape(1, channels, 1, 1).clone())
             self.register_buffer("affine_bias", source.bias.detach().reshape(1, channels, 1, 1).clone())
@@ -90,9 +96,10 @@ class FixedGroupNorm(nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         mean = self._group_average(value)
-        mean_square = self._group_average(value * value)
-        variance = torch.relu(mean_square - mean * mean)
-        output = (value - mean) * torch.rsqrt(variance + self.eps)
+        centered = value - mean
+        scaled_centered = centered * self.variance_scale
+        variance = self._group_average(scaled_centered * scaled_centered)
+        output = scaled_centered * torch.rsqrt(variance + self.scaled_eps)
         if self.affine_weight is not None:
             output = output * self.affine_weight + self.affine_bias
         return output
@@ -120,9 +127,9 @@ class FixedAdaGN(nn.Module):
 
     def forward(self, value: torch.Tensor, codeword: torch.Tensor) -> torch.Tensor:
         quantizer_mean = self.quantizer_pool(codeword)
-        quantizer_mean_square = self.quantizer_pool(codeword * codeword)
-        quantizer_variance = torch.relu(
-            quantizer_mean_square - quantizer_mean * quantizer_mean,
+        quantizer_centered = codeword - quantizer_mean
+        quantizer_variance = self.quantizer_pool(
+            quantizer_centered * quantizer_centered,
         ) * self.unbiased_factor
         scale_base = quantizer_variance + self.eps
         scale = self.gamma(scale_base * torch.rsqrt(scale_base))
@@ -1017,8 +1024,8 @@ def main() -> None:
             "qp": args.qp,
             "selected_targets": selected_keys,
             "rewrite": {
-                "GroupNorm": "biased E[x^2]-E[x]^2, RELU, MUL(RSQRT), AvgPool and sparse ordinary Conv2D",
-                "AdaGN": "unbiased variance N/(N-1), MUL(RSQRT), Linear mapped to Conv2D",
+                "GroupNorm": "FP16-stable scaled E[(s*(x-mean))^2] with s=1/16 at 32x64, MUL(RSQRT), AvgPool and sparse ordinary Conv2D",
+                "AdaGN": "FP16-stable centered variance with N/(N-1), MUL(RSQRT), Linear mapped to Conv2D",
                 "P PixelUnshuffle2": "fixed one-hot Conv2D kernel=2 stride=2",
                 "high-resolution GroupNorm": "hierarchical AvgPool 8x8 then global AvgPool",
                 "P feature decoder": "split into latent, MLP0, and MLP1 DLA graphs",

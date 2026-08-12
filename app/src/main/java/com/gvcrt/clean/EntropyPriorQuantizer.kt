@@ -10,6 +10,50 @@ internal data class EntropyPriorStage(
 
 /** Source-equivalent masked quantization; only the continuous prior runs in TFLite. */
 internal object EntropyPriorQuantizer {
+    fun restoreDecoded(
+        decodedSymbols: ByteArray,
+        packedMeans: TensorValue,
+        packedScales: TensorValue,
+        phase: Int,
+        groups: Int,
+        outputName: String,
+    ): EntropyPriorStage {
+        require(packedMeans.shape.contentEquals(packedScales.shape)) {
+            "decoded prior means/scales shapes must match"
+        }
+        require(decodedSymbols.size == packedScales.numel) {
+            "decoded symbol count=${decodedSymbols.size}, expected=${packedScales.numel}"
+        }
+        val packedShape = packedScales.shape
+        require(packedShape.size == 4 && packedShape[0] == 1L && phase in 0 until groups) {
+            "unsupported decoded prior tensor ${packedShape.contentToString()} phase=$phase groups=$groups"
+        }
+        val packedChannels = packedShape[1].toInt()
+        val height = packedShape[2].toInt()
+        val width = packedShape[3].toInt()
+        val channels = packedChannels * groups
+        val plane = height * width
+        val symbolValues = FloatArray(decodedSymbols.size) { decodedSymbols[it].toFloat() }
+        val yHat = FloatArray(channels * plane)
+
+        for (row in 0 until height) for (column in 0 until width) {
+            val activeGroup = activeGroup(groups, phase, row, column)
+            val spatial = row * width + column
+            val channelBase = activeGroup * packedChannels
+            for (packedChannel in 0 until packedChannels) {
+                val packedIndex = packedChannel * plane + spatial
+                val fullIndex = (channelBase + packedChannel) * plane + spatial
+                yHat[fullIndex] = symbolValues[packedIndex] + packedMeans.data[packedIndex]
+            }
+        }
+        val fullShape = longArrayOf(1, channels.toLong(), height.toLong(), width.toLong())
+        return EntropyPriorStage(
+            TensorValue("${outputName}_symbols", packedShape, symbolValues),
+            packedScales.renamed("${outputName}_scales"),
+            TensorValue(outputName, fullShape, yHat),
+        )
+    }
+
     fun quantize(
         yScaled: TensorValue,
         means: TensorValue,

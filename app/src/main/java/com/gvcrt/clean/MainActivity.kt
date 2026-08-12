@@ -27,6 +27,7 @@ class MainActivity : Activity() {
     private var running = false
     private var imageRunner: ImageInferenceRunner? = null
     private var imageRunnerBackend: OnnxBackend? = null
+    private var largeOnlineRunner: LargeOnlineCodecRunner? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -70,6 +71,12 @@ class MainActivity : Activity() {
         val largeIpCodecButton = moduleButton("Large I/P\ncodec") {
             startTests(listOf("large_i_entropy_codec", "large_p_entropy_codec"))
         }
+        val largeIDecodeButton = moduleButton("Large I/P\ndecode") {
+            startTests(listOf("large_i_entropy_decode", "large_p_entropy_decode"))
+        }
+        val largeMainButton = moduleButton("Large full\ncodec") {
+            startTests(listOf("large_online_main"))
+        }
         moduleButtons = buildList {
             addAll(
                 listOf(
@@ -87,6 +94,8 @@ class MainActivity : Activity() {
                 add(largeIPrecisionButton)
                 add(largeISpeedButton)
                 add(largeIpCodecButton)
+                add(largeIDecodeButton)
+                add(largeMainButton)
             }
         }
 
@@ -120,6 +129,8 @@ class MainActivity : Activity() {
             addView(largeIPrecisionButton, buttonLayoutParams())
             addView(largeISpeedButton, buttonLayoutParams())
             addView(largeIpCodecButton, buttonLayoutParams())
+            addView(largeIDecodeButton, buttonLayoutParams())
+            addView(largeMainButton, buttonLayoutParams())
         }
         inputImage = comparisonImageView()
         reconImage = comparisonImageView()
@@ -202,7 +213,21 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("largeIEntropyMergedPrecisionTest", false) ||
                 intent.getBooleanExtra("largeIEntropyMergedTest", false) -> listOf("large_i_entropy_merged_precision")
             intent.getBooleanExtra("largeIEntropyCodecTest", false) -> listOf("large_i_entropy_codec")
+            intent.getBooleanExtra("largeIEntropyRansMergedTest", false) -> listOf("large_i_entropy_rans_merged")
+            intent.getBooleanExtra("largeIEntropyDecodeSpeedTest", false) -> listOf("large_i_entropy_decode_speed")
+            intent.getBooleanExtra("largeIEntropyDecodeTest", false) -> listOf("large_i_entropy_decode")
+            intent.getBooleanExtra("largeIEntropyDecodeMergedSpeedTest", false) ->
+                listOf("large_i_entropy_decode_merged_speed")
+            intent.getBooleanExtra("largeIEntropyDecodeMergedTest", false) ->
+                listOf("large_i_entropy_decode_merged")
             intent.getBooleanExtra("largePEntropyCodecTest", false) -> listOf("large_p_entropy_codec")
+            intent.getBooleanExtra("largePEntropyMergedSpeedTest", false) ->
+                listOf("large_p_entropy_merged_speed")
+            intent.getBooleanExtra("largePEntropyDecodeSpeedTest", false) ->
+                listOf("large_p_entropy_decode_speed")
+            intent.getBooleanExtra("largePEntropyDecodeTest", false) -> listOf("large_p_entropy_decode")
+            intent.getBooleanExtra("largeOnlineMainTest", false) -> listOf("large_online_main")
+            intent.getBooleanExtra("ransCustomOpPartitionTest", false) -> listOf("rans_custom_op_partition")
             intent.getBooleanExtra("enterpriseTfliteTest", false) -> listOf("enterprise_tflite")
             else -> emptyList()
         }
@@ -332,6 +357,12 @@ class MainActivity : Activity() {
                         moduleName == "large_i_entropy_codec" -> {
                             LargeIEntropyCodecProbe(this, ::emit).run()
                         }
+                        moduleName == "large_i_entropy_rans_merged" -> {
+                            LargeIEntropyCodecProbe(this, ::emit).runRansMerged(
+                                warmupRuns = intent.getIntExtra("largeIEntropyRansMergedWarmup", 3),
+                                measuredRuns = intent.getIntExtra("largeIEntropyRansMergedMeasured", 10),
+                            )
+                        }
                         moduleName == "large_i_entropy_merged_precision" -> {
                             LargeIEntropyCodecProbe(this, ::emit).run(
                                 warmupRuns = 0,
@@ -350,6 +381,67 @@ class MainActivity : Activity() {
                         }
                         moduleName == "large_p_entropy_codec" -> {
                             LargePEntropyCodecProbe(this, ::emit).run()
+                        }
+                        moduleName == "large_p_entropy_merged_speed" -> {
+                            LargePEntropyCodecProbe(this, ::emit).runMergedSpeed(
+                                warmupRuns = intent.getIntExtra("largePEntropyMergedWarmup", 3),
+                                measuredRuns = intent.getIntExtra("largePEntropyMergedMeasured", 10),
+                            )
+                        }
+                        moduleName == "large_p_entropy_decode" -> {
+                            LargePEntropyDecoderMergedProbe(this, ::emit).run(
+                                fastRelaxFp32 = intent.getBooleanExtra("largePEntropyDecodeFast", true),
+                                validatePrecision = true,
+                            )
+                        }
+                        moduleName == "large_p_entropy_decode_speed" -> {
+                            LargePEntropyDecoderMergedProbe(this, ::emit).run(
+                                warmupRuns = intent.getIntExtra("largePEntropyDecodeWarmup", 3),
+                                measuredRuns = intent.getIntExtra("largePEntropyDecodeMeasured", 10),
+                                fastRelaxFp32 = true,
+                                validatePrecision = false,
+                            )
+                        }
+                        moduleName == "large_online_main" -> {
+                            largeOnlineRunner(::emit).run(
+                                imagePath = intent.getStringExtra("imagePath"),
+                                warmupRuns = intent.getIntExtra("largeOnlineWarmup", 1),
+                                measuredRuns = intent.getIntExtra("largeOnlineMeasured", 1),
+                            )
+                        }
+                        moduleName == "rans_custom_op_partition" -> {
+                            TfliteCustomOpPartitionProbe(this, ::emit).run(
+                                warmupRuns = intent.getIntExtra("ransCustomOpWarmup", 3),
+                                measuredRuns = intent.getIntExtra("ransCustomOpMeasured", 10),
+                            )
+                        }
+                        moduleName == "large_i_entropy_decode" -> {
+                            LargeIEntropyDecoderMergedProbe(this, ::emit).run(
+                                fastRelaxFp32 = intent.getBooleanExtra("largeIEntropyDecodeFast", true),
+                                validatePrecision = true,
+                            )
+                        }
+                        moduleName == "large_i_entropy_decode_speed" -> {
+                            LargeIEntropyDecoderMergedProbe(this, ::emit).run(
+                                warmupRuns = intent.getIntExtra("largeIEntropyDecodeWarmup", 3),
+                                measuredRuns = intent.getIntExtra("largeIEntropyDecodeMeasured", 10),
+                                fastRelaxFp32 = true,
+                                validatePrecision = false,
+                            )
+                        }
+                        moduleName == "large_i_entropy_decode_merged" -> {
+                            LargeIEntropyDecoderMergedProbe(this, ::emit).run(
+                                fastRelaxFp32 = intent.getBooleanExtra("largeIEntropyDecodeMergedFast", false),
+                                validatePrecision = true,
+                            )
+                        }
+                        moduleName == "large_i_entropy_decode_merged_speed" -> {
+                            LargeIEntropyDecoderMergedProbe(this, ::emit).run(
+                                warmupRuns = intent.getIntExtra("largeIEntropyDecodeMergedWarmup", 3),
+                                measuredRuns = intent.getIntExtra("largeIEntropyDecodeMergedMeasured", 10),
+                                fastRelaxFp32 = true,
+                                validatePrecision = false,
+                            )
                         }
                         moduleName.endsWith("_speed") -> {
                             val speedBackend = if (
@@ -446,6 +538,11 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun largeOnlineRunner(emit: (String) -> Unit): LargeOnlineCodecRunner =
+        largeOnlineRunner ?: LargeOnlineCodecRunner(this, emit, ::showImageComparison).also {
+            largeOnlineRunner = it
+        }
+
     private fun isMemoryDiagnosticLine(line: String): Boolean =
         line.startsWith("memory_") ||
             line.startsWith("image_memory_") ||
@@ -459,6 +556,8 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         imageRunner?.close()
         imageRunner = null
+        largeOnlineRunner?.close()
+        largeOnlineRunner = null
         super.onDestroy()
     }
 

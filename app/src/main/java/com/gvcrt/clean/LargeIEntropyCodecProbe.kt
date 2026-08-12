@@ -7,6 +7,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.util.Locale
 
@@ -31,30 +33,25 @@ class LargeIEntropyCodecProbe(
         }
         val manifest = JSONObject(manifestFile.readText())
         val i = manifest.getJSONObject("i")
-        val mergedModel = i.getJSONObject("merged_model")
-        require(mergedModel.getString("name") == MERGED_MODEL) {
-            "unsupported I entropy model: ${mergedModel.getString("name")}"
-        }
-        val mergedFile = resolvePackageFile(packageRoot, mergedModel.getString("file"))
+        val mergedFile = packageRoot.resolve("models/$RANS_MERGED_MODEL.tflite")
         require(mergedFile.isFile) {
-            "missing standalone merged model: ${mergedFile.absolutePath}"
+            "missing canonical I entropy+rANS model: ${mergedFile.absolutePath}"
         }
         val mergedSha = sha256(mergedFile)
-        require(mergedSha.equals(mergedModel.getString("sha256"), ignoreCase = true)) {
-            "merged model SHA mismatch actual=$mergedSha expected=${mergedModel.getString("sha256")}"
-        }
 
         val runtimes = linkedMapOf<String, OfficialNeuronRuntime>()
+        var entropyRuntime: IEntropyRansMergedRuntime? = null
         try {
             emit(
-                "large_i_codec_start backend=official_aar_neuron entropy_io=nhwc_merged " +
+                "large_i_codec_start backend=official_aar_neuron entropy_io=nhwc_merged_rans " +
                     "allow_fp16=true compile_options=--relax-fp32 preference=FAST_SINGLE_ANSWER " +
                     "warmup=$warmupRuns measured=$measuredRuns roundtrip=$validateRoundtrip " +
                     "qp=${manifest.getInt("qp")} package=${manifest.getString("package")} root=${packageRoot.absolutePath}",
             )
             emit(
-                "large_i_codec_model name=$MERGED_MODEL file=${mergedFile.absolutePath} " +
-                    "bytes=${mergedFile.length()} sha256=$mergedSha packaging=standalone",
+                "large_i_codec_model name=$RANS_MERGED_MODEL file=${mergedFile.absolutePath} " +
+                    "bytes=${mergedFile.length()} sha256=$mergedSha packaging=standalone " +
+                    "custom_op=GVC_RT_RANS_ENCODE custom_backend=cpu",
             )
 
             fun runtime(name: String, explicitModel: File? = null): OfficialNeuronRuntime = runtimes.getOrPut(name) {
@@ -72,25 +69,25 @@ class LargeIEntropyCodecProbe(
             )
             val y = NhwcTensorCodec.fromF32Le("i_y_pre_prior", Y_SHAPE, encoder.outputs.single())
 
-            val entropyRuntime = runtime(MERGED_MODEL, mergedFile)
-            val entropyRun = runRepeated(
-                label = "i_entropy_merged",
-                runtime = entropyRuntime,
-                inputs = listOf(NhwcFloatTensor.fromNchw(y, "i_y_pre_prior").toF32Le()),
+            val activeEntropyRuntime = IEntropyRansMergedRuntime.create(
+                mergedFile,
+                context.cacheDir.resolve("enterprise_tflite/large/online_relax_fp32/$RANS_MERGED_MODEL"),
+            )
+            entropyRuntime = activeEntropyRuntime
+            emit("large_i_codec_create model=$RANS_MERGED_MODEL options=${activeEntropyRuntime.optionsSummary}")
+            val entropyInput = NhwcFloatTensor.fromNchw(y, "i_y_pre_prior").toF32Le()
+            val entropyRun = runRansMergedRepeated(
+                runtime = activeEntropyRuntime,
+                input = entropyInput,
                 warmupRuns = warmupRuns,
                 measuredRuns = measuredRuns,
             )
-            val entropyOutputs = decodeMergedOutputs(entropyRun.outputs)
+            val entropyOutputs = decodeMergedOutputs(entropyRun.outputs.take(10))
+            val payload = decodeMergedPayload(entropyRun.outputs)
             val entropy = readEntropySpec(packageRoot, i)
-            val rans = runRansRepeated(
-                entropyOutputs = entropyOutputs,
-                entropy = entropy,
-                warmupRuns = warmupRuns,
-                measuredRuns = measuredRuns,
-            )
 
             val roundtripStatus = if (validateRoundtrip) {
-                validateRansRoundtrip(rans.payload, entropyOutputs, entropy)
+                validateRansRoundtrip(payload, entropyOutputs, entropy)
                 "PASS"
             } else {
                 emit("large_i_codec_diagnostic stage=i_rans_roundtrip status=SKIPPED excluded_from_encode_total=true")
@@ -106,7 +103,7 @@ class LargeIEntropyCodecProbe(
                 measuredRuns = measuredRuns,
             )
             val frame = NhwcTensorCodec.fromF32Le("i_reference_frame", FRAME_SHAPE, decoder.outputs.single())
-            val steadyComponentSum = encoder.stats.meanMs + entropyRun.stats.meanMs + rans.stats.meanMs + decoder.stats.meanMs
+            val steadyComponentSum = encoder.stats.meanMs + entropyRun.stats.meanMs + decoder.stats.meanMs
             emit(
                 "large_i_codec_speed stage=component_sum samples=$measuredRuns " +
                     "mean_ms=${formatMs(steadyComponentSum)} " +
@@ -115,10 +112,9 @@ class LargeIEntropyCodecProbe(
             if (warmupRuns > 0 || measuredRuns > 1) {
                 runPipelineRepeated(
                     encoderRuntime = encoderRuntime,
-                    entropyRuntime = entropyRuntime,
+                    entropyRuntime = activeEntropyRuntime,
                     decoderRuntime = decoderRuntime,
                     inputFrame = inputFrame,
-                    entropy = entropy,
                     warmupRuns = warmupRuns,
                     measuredRuns = measuredRuns,
                 )
@@ -127,14 +123,94 @@ class LargeIEntropyCodecProbe(
             val outputRoot = context.getExternalFilesDir(null)!!
                 .resolve("enterprise_tflite_codec/large/i")
             if (dumpOutputs) {
-                writeOutputs(outputRoot, entropyOutputs, rans.payload, frame)
+                writeOutputs(outputRoot, entropyOutputs, payload, frame)
             }
             emit(
-                "large_i_codec_complete payload_bytes=${rans.payload.size} payload_sha256=${sha256(rans.payload)} " +
-                    "rans_roundtrip=$roundtripStatus dump_outputs=$dumpOutputs output=${outputRoot.absolutePath}",
+                "large_i_codec_complete payload_bytes=${payload.size} payload_sha256=${sha256(payload)} " +
+                    "rans_roundtrip=$roundtripStatus dump_outputs=$dumpOutputs output=${outputRoot.absolutePath} " +
+                    "canonical_entropy_path=$RANS_MERGED_MODEL",
             )
         } finally {
+            entropyRuntime?.close()
             runtimes.values.forEach(OfficialNeuronRuntime::close)
+        }
+    }
+
+    fun runRansMerged(warmupRuns: Int = 3, measuredRuns: Int = 10) {
+        require(warmupRuns >= 0 && measuredRuns > 0)
+        val packageRoot = findPackageRoot()
+        val manifest = JSONObject(packageRoot.resolve(MANIFEST).readText())
+        val i = manifest.getJSONObject("i")
+        val sourceModelRecord = i.getJSONObject("merged_model")
+        val sourceModel = resolvePackageFile(packageRoot, sourceModelRecord.getString("file"))
+        val ransModel = packageRoot.resolve("models/$RANS_MERGED_MODEL.tflite")
+        require(ransModel.isFile) {
+            "missing ${ransModel.absolutePath}; generate it with server_tools/append_i_rans_custom_op.py"
+        }
+        emit(
+            "large_i_rans_merged_start graph=$RANS_MERGED_MODEL custom_op=GVC_RT_RANS_ENCODE " +
+                "custom_backend=cpu neural_backend=official_aar_neuron allow_fp16=true " +
+                "compile_options=--relax-fp32 accelerator=mtk-neuron preference=FAST_SINGLE_ANSWER " +
+                "warmup=$warmupRuns measured=$measuredRuns sha256=${sha256(ransModel)}",
+        )
+
+        val encoderRuntime = createRuntime(packageRoot, "i_encoder")
+        val sourceRuntime = createRuntime(packageRoot, MERGED_MODEL, sourceModel)
+        val ransRuntime = IEntropyRansMergedRuntime.create(
+            ransModel,
+            context.cacheDir.resolve("enterprise_tflite/large/online_relax_fp32/$RANS_MERGED_MODEL"),
+        )
+        try {
+            emit("large_i_rans_merged_create options=${ransRuntime.optionsSummary}")
+            val inputFrame = resolvePackageFile(packageRoot, i.getString("input_i_frame")).readBytes()
+            val yBytes = encoderRuntime.run(listOf(inputFrame)).single()
+            val y = NhwcTensorCodec.fromF32Le("i_y_pre_prior", Y_SHAPE, yBytes)
+            val entropyInput = NhwcFloatTensor.fromNchw(y, "i_y_pre_prior").toF32Le()
+
+            val sourceOutputs = sourceRuntime.run(listOf(entropyInput))
+            val sourceEntropy = decodeMergedOutputs(sourceOutputs)
+            val entropySpec = readEntropySpec(packageRoot, i)
+            val expectedPayload = encodePayload(sourceEntropy, entropySpec)
+
+            repeat(warmupRuns) { ransRuntime.run(entropyInput, copyOutputs = false) }
+            val times = DoubleArray(measuredRuns)
+            repeat(measuredRuns) { index ->
+                val started = SystemClock.elapsedRealtimeNanos()
+                ransRuntime.run(entropyInput, copyOutputs = false)
+                times[index] = elapsedMs(started)
+            }
+            emitSpeed("i_entropy_rans_merged", times, "native_runtime_direct_input")
+            val outputs = ransRuntime.run(entropyInput, copyOutputs = true)
+            emit("large_i_rans_merged_diagnostic output_copy_excluded_from_speed=true")
+            require(outputs.size == 12) { "$RANS_MERGED_MODEL output count=${outputs.size}, expected=12" }
+            val actualEntropy = decodeMergedOutputs(outputs.take(10))
+            val payloadSize = ByteBuffer.wrap(outputs[11]).order(ByteOrder.LITTLE_ENDIAN).int
+            require(payloadSize in 0..outputs[10].size) {
+                "invalid in-graph payload size=$payloadSize capacity=${outputs[10].size}"
+            }
+            val actualPayload = outputs[10].copyOf(payloadSize)
+            val actualIndependentPayload = encodePayload(actualEntropy, entropySpec)
+            require(actualPayload.contentEquals(actualIndependentPayload)) {
+                "in-graph rANS differs from independent rANS for the same graph outputs"
+            }
+            require(actualPayload.contentEquals(expectedPayload)) {
+                "in-graph rANS differs from existing merged-graph payload"
+            }
+            val yHatMaxAbs = actualEntropy.yHat.data.indices.maxOf { index ->
+                kotlin.math.abs(actualEntropy.yHat.data[index] - sourceEntropy.yHat.data[index]).toDouble()
+            }
+            emit(
+                "large_i_rans_merged_compare payload_exact=true payload_bytes=$payloadSize " +
+                    "payload_sha256=${sha256(actualPayload)} y_hat_max_abs=$yHatMaxAbs",
+            )
+            emit(
+                "large_i_rans_merged_complete status=PASS boundary=neuron_entropy_prior_to_cpu_rans " +
+                    "single_interpreter_invoke=true canonical_path_replaced=false",
+            )
+        } finally {
+            ransRuntime.close()
+            sourceRuntime.close()
+            encoderRuntime.close()
         }
     }
 
@@ -157,42 +233,42 @@ class LargeIEntropyCodecProbe(
         return RuntimeRun(outputs, stats)
     }
 
-    private fun runRansRepeated(
-        entropyOutputs: IEntropyOutputs,
-        entropy: LocalEntropySpec,
+    private fun runRansMergedRepeated(
+        runtime: IEntropyRansMergedRuntime,
+        input: ByteArray,
         warmupRuns: Int,
         measuredRuns: Int,
-    ): RansRun {
-        repeat(warmupRuns) { encodePayload(entropyOutputs, entropy) }
+    ): RuntimeRun {
+        repeat(warmupRuns) { runtime.run(input, copyOutputs = false) }
         val times = DoubleArray(measuredRuns)
-        var payload = ByteArray(0)
         repeat(measuredRuns) { index ->
             val started = SystemClock.elapsedRealtimeNanos()
-            payload = encodePayload(entropyOutputs, entropy)
+            runtime.run(input, copyOutputs = false)
             times[index] = elapsedMs(started)
         }
-        return RansRun(payload, emitSpeed("i_rans", times, "not_applicable"))
+        val stats = emitSpeed("i_entropy_rans_merged", times, "native_runtime_direct_input")
+        val outputs = runtime.run(input, copyOutputs = true)
+        emit("large_i_codec_diagnostic stage=i_entropy_rans_output_copy excluded_from_speed=true")
+        return RuntimeRun(outputs, stats)
     }
 
     private fun runPipelineRepeated(
         encoderRuntime: OfficialNeuronRuntime,
-        entropyRuntime: OfficialNeuronRuntime,
+        entropyRuntime: IEntropyRansMergedRuntime,
         decoderRuntime: OfficialNeuronRuntime,
         inputFrame: ByteArray,
-        entropy: LocalEntropySpec,
         warmupRuns: Int,
         measuredRuns: Int,
     ) {
         fun runOnce() {
             val yBytes = encoderRuntime.run(listOf(inputFrame)).single()
             val y = NhwcTensorCodec.fromF32Le("i_y_pre_prior", Y_SHAPE, yBytes)
-            val mergedBytes = entropyRuntime.run(
-                listOf(NhwcFloatTensor.fromNchw(y, "i_y_pre_prior").toF32Le()),
+            val canonicalOutputs = entropyRuntime.runCanonical(
+                NhwcFloatTensor.fromNchw(y, "i_y_pre_prior").toF32Le(),
             )
-            val entropyOutputs = decodeMergedOutputs(mergedBytes)
-            encodePayload(entropyOutputs, entropy)
+            require(canonicalOutputs.size == 2) { "canonical merged rANS output count mismatch" }
             decoderRuntime.run(
-                listOf(NhwcTensorCodec.toF32Le(entropyOutputs.yHat)),
+                listOf(canonicalOutputs[0]),
                 copyOutputs = false,
             )
         }
@@ -275,6 +351,17 @@ class LargeIEntropyCodecProbe(
             outputBytes[9],
         ).toNchw("i_y_hat")
         return IEntropyOutputs(zHat, quantized, yHat)
+    }
+
+    private fun decodeMergedPayload(outputBytes: List<ByteArray>): ByteArray {
+        require(outputBytes.size == 12) {
+            "$RANS_MERGED_MODEL output count=${outputBytes.size}, expected=12"
+        }
+        val payloadSize = ByteBuffer.wrap(outputBytes[11]).order(ByteOrder.LITTLE_ENDIAN).int
+        require(payloadSize in 0..outputBytes[10].size) {
+            "invalid in-graph payload size=$payloadSize capacity=${outputBytes[10].size}"
+        }
+        return outputBytes[10].copyOf(payloadSize)
     }
 
     private fun writeOutputs(
@@ -424,7 +511,6 @@ class LargeIEntropyCodecProbe(
     }
 
     private data class RuntimeRun(val outputs: List<ByteArray>, val stats: SpeedStats)
-    private data class RansRun(val payload: ByteArray, val stats: SpeedStats)
     private data class SpeedStats(val meanMs: Double, val p50Ms: Double, val p90Ms: Double)
     private data class PriorSymbols(val symbols: TensorValue, val scales: TensorValue)
     private data class IEntropyOutputs(
@@ -442,6 +528,7 @@ class LargeIEntropyCodecProbe(
     private companion object {
         const val MANIFEST = "large_entropy_manifest.json"
         const val MERGED_MODEL = "i_entropy_prior_merged"
+        const val RANS_MERGED_MODEL = "i_entropy_prior_merged_rans"
         val FRAME_SHAPE = longArrayOf(1, 3, 256, 512)
         val Y_SHAPE = longArrayOf(1, 256, 16, 32)
         val Z_NHWC_SHAPE = longArrayOf(1, 4, 8, 128)

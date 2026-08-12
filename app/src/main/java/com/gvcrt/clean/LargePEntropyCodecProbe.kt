@@ -7,6 +7,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.util.Locale
 
@@ -15,14 +17,51 @@ class LargePEntropyCodecProbe(
     private val context: Context,
     private val emit: (String) -> Unit,
 ) {
+    fun runMergedSpeed(warmupRuns: Int = 3, measuredRuns: Int = 10) {
+        require(warmupRuns >= 0 && measuredRuns > 0)
+        val packageRoot = findPackageRoot()
+        val outputRoot = context.getExternalFilesDir(null)!!.resolve("enterprise_tflite_codec/large/p")
+        val yFile = outputRoot.resolve("p_y_pre_prior.nchw.f32le")
+        val ctxTFile = outputRoot.resolve("p_ctx_t.nchw.f32le")
+        require(yFile.isFile && ctxTFile.isFile) {
+            "missing P entropy inputs; run largePEntropyCodecTest first"
+        }
+        val y = TensorIO.readF32Le("p_y_pre_prior", Y_SHAPE, yFile.readBytes())
+        val ctxT = TensorIO.readF32Le("p_ctx_t", CTX_SHAPE, ctxTFile.readBytes())
+        val yNhwc = NhwcTensorCodec.toF32Le(y)
+        val ctxTNhwc = NhwcTensorCodec.toF32Le(ctxT)
+        val model = findMergedModel(packageRoot, ENCODER_MERGED_MODEL)
+        val createStarted = SystemClock.elapsedRealtimeNanos()
+        PEntropyRansMergedRuntime.create(
+            model,
+            context.cacheDir.resolve("enterprise_tflite/large/p_entropy_prior_merged"),
+        ).use { runtime ->
+            emit(
+                "large_p_entropy_merged_speed_start warmup=$warmupRuns measured=$measuredRuns " +
+                    "create_ms=${format(elapsedMs(createStarted))} model_sha256=${sha256(model)} " +
+                    "options=${runtime.optionsSummary}",
+            )
+            repeat(warmupRuns) { runtime.run(yNhwc, ctxTNhwc, copyOutputs = false) }
+            val samples = DoubleArray(measuredRuns) {
+                val started = SystemClock.elapsedRealtimeNanos()
+                runtime.run(yNhwc, ctxTNhwc, copyOutputs = false)
+                elapsedMs(started)
+            }
+            val canonical = runtime.runCanonical(yNhwc, ctxTNhwc)
+            emit(
+                "large_p_entropy_merged_speed samples=${samples.size} mean_ms=${format(samples.average())} " +
+                    "p50_ms=${format(percentile(samples, 0.50))} p90_ms=${format(percentile(samples, 0.90))} " +
+                    "includes_create=false payload_bytes=${canonical[1].size} payload_sha256=${sha256(canonical[1])}",
+            )
+        }
+    }
+
     fun run() {
         val packageRoot = findPackageRoot()
         val manifestFile = packageRoot.resolve(MANIFEST)
         require(manifestFile.isFile) { "missing $MANIFEST: ${manifestFile.absolutePath}" }
         val manifest = JSONObject(manifestFile.readText())
-        require(manifest.has("p")) { "package does not contain P-frame entropy assets" }
-        val p = manifest.getJSONObject("p")
-        val forceZero = manifest.getDouble("force_zero_thres").toFloat()
+        val p = manifest.optJSONObject("p")
         val runtimes = linkedMapOf<String, OfficialNeuronRuntime>()
         try {
             emit(
@@ -53,7 +92,7 @@ class LargePEntropyCodecProbe(
             }
             val ctx = temporal[1]
             val ctxT = temporal[2]
-            val inputFrame = packageRoot.resolve(p.getString("input_p_frame")).readBytes()
+            val inputFrame = packageRoot.resolve(findPInputPath(packageRoot, p)).readBytes()
             val encoderRuntime = runtime("p_encoder")
             val y = timed("p_encoder") {
                 runNchw(
@@ -62,94 +101,60 @@ class LargePEntropyCodecProbe(
                     listOf(TensorSpec("p_y_pre_prior", Y_SHAPE)),
                 ).single()
             }
-            val hyperEncRuntime = runtime("p_hyper_enc_continuous")
-            val zPreQuant = timed("p_hyper_enc") {
-                runNchw(
-                    hyperEncRuntime,
-                    listOf(NhwcTensorCodec.toF32Le(y)),
-                    listOf(TensorSpec("p_z_pre_quant", Z_SHAPE)),
-                ).single()
-            }
-            val zHat = timed("p_z_quant") { quantizeInt8(zPreQuant, "p_z_hat") }
-            val hyperPriorRuntime = runtime("p_hyper_prior_shared")
-            val common = timed("p_hyper_prior") {
-                runNchw(
-                    hyperPriorRuntime,
-                    listOf(NhwcTensorCodec.toF32Le(zHat), NhwcTensorCodec.toF32Le(ctxT)),
-                    listOf(TensorSpec("p_common_params", COMMON_SHAPE)),
-                ).single()
-            }
-            val priorStage0Runtime = runtime("p_prior_stage0_params")
-            val stage0Params = timed("p_prior_stage0") {
-                runNchw(
-                    priorStage0Runtime,
-                    listOf(NhwcTensorCodec.toF32Le(common)),
-                    listOf(
-                        TensorSpec("p_q_dec", Y_SHAPE),
-                        TensorSpec("p_stage0_scales", Y_SHAPE),
-                        TensorSpec("p_stage0_means", Y_SHAPE),
-                    ),
-                )
-            }
-            val yScaled = EntropyPriorQuantizer.divide(y, stage0Params[0], "p_y_scaled")
-            val quantized = ArrayList<EntropyPriorStage>(2)
-            var yHatSoFar = timed("p_quant_stage0") {
-                EntropyPriorQuantizer.quantize(
-                    yScaled,
-                    stage0Params[2],
-                    stage0Params[1],
-                    phase = 0,
-                    groups = 2,
-                    forceZeroThreshold = forceZero,
-                ).also(quantized::add).yHat
-            }
-            val priorStage1Runtime = runtime("p_prior_stage1_continuous")
-            val stage1Params = timed("p_prior_stage1") {
-                runNchw(
-                    priorStage1Runtime,
-                    listOf(NhwcTensorCodec.toF32Le(yHatSoFar), NhwcTensorCodec.toF32Le(common)),
-                    listOf(
-                        TensorSpec("p_stage1_scales", Y_SHAPE),
-                        TensorSpec("p_stage1_means", Y_SHAPE),
-                    ),
-                )
-            }
-            val stage1 = timed("p_quant_stage1") {
-                EntropyPriorQuantizer.quantize(
-                    yScaled,
-                    stage1Params[1],
-                    stage1Params[0],
-                    phase = 1,
-                    groups = 2,
-                    forceZeroThreshold = forceZero,
-                ).also(quantized::add)
-            }
-            yHatSoFar = EntropyPriorQuantizer.add(yHatSoFar, stage1.yHat, "p_y_hat_so_far")
-            val yHat = EntropyPriorQuantizer.multiply(yHatSoFar, stage0Params[0], "p_y_hat")
-            val entropy = readEntropySpec(packageRoot, p)
-            val payload = timed("p_rans") {
-                RansNativeEncoder.create(entropy.gaussian, entropy.z, useTwoEncoders = false).use { encoder ->
-                    encoder.encodeZ(EntropySymbols.zSymbols(zHat), entropy.zStartOffset, entropy.zPerChannelSize)
-                    quantized.forEach { encoder.encodeY(it.symbols, it.scales) }
-                    encoder.flush()
+            val mergedModel = findMergedModel(packageRoot, ENCODER_MERGED_MODEL)
+            val mergedCreateStarted = SystemClock.elapsedRealtimeNanos()
+            val merged = PEntropyRansMergedRuntime.create(
+                mergedModel,
+                context.cacheDir.resolve("enterprise_tflite/large/p_entropy_prior_merged"),
+            )
+            emit(
+                "large_p_codec_create model=$ENCODER_MERGED_MODEL " +
+                    "create_ms=${format(elapsedMs(mergedCreateStarted))} options=${merged.optionsSummary}",
+            )
+            val mergedRaw = merged.use {
+                timed("p_entropy_prior_merged_rans") {
+                    it.run(NhwcTensorCodec.toF32Le(y), NhwcTensorCodec.toF32Le(ctxT))
                 }
             }
-            timed("p_rans_roundtrip") {
-                NativeRans.create(entropy.gaussian, entropy.z).use { decoder ->
-                    val decoded = decoder.decode(
-                        payload,
-                        zHat.numel,
-                        entropy.zStartOffset,
-                        entropy.zPerChannelSize,
-                        quantized.map { EntropySymbols.indexesForScales(it.scales) }.toTypedArray(),
-                    )
-                    require(decoded[0].contentEquals(EntropySymbols.zSymbols(zHat))) { "p rANS z roundtrip mismatch" }
-                    quantized.forEachIndexed { index, stage ->
-                        require(decoded[index + 1].contentEquals(symbolBytes(stage.symbols))) {
-                            "p rANS y stage=$index roundtrip mismatch"
+            require(mergedRaw.size == 8) { "P merged entropy outputs=${mergedRaw.size}, expected=8" }
+            val zHat = NhwcTensorCodec.fromF32Le("p_z_hat", Z_SHAPE, mergedRaw[0])
+            val ySymbols = listOf(
+                NhwcTensorCodec.fromF32Le("p_y_q_w_0", PACKED_SHAPE, mergedRaw[1]),
+                NhwcTensorCodec.fromF32Le("p_y_q_w_1", PACKED_SHAPE, mergedRaw[2]),
+            )
+            val yScales = listOf(
+                NhwcTensorCodec.fromF32Le("p_s_w_0", PACKED_SHAPE, mergedRaw[3]),
+                NhwcTensorCodec.fromF32Le("p_s_w_1", PACKED_SHAPE, mergedRaw[4]),
+            )
+            val yHat = NhwcTensorCodec.fromF32Le("p_y_hat", Y_SHAPE, mergedRaw[5])
+            val payloadSize = ByteBuffer.wrap(mergedRaw[7]).order(ByteOrder.LITTLE_ENDIAN).int
+            require(payloadSize in 1..mergedRaw[6].size) { "invalid P merged payload size=$payloadSize" }
+            val payload = mergedRaw[6].copyOf(payloadSize)
+            val roundtripStatus = if (p != null) {
+                val entropy = readEntropySpec(packageRoot, p)
+                timed("p_rans_roundtrip") {
+                    NativeRans.create(entropy.gaussian, entropy.z).use { decoder ->
+                        val decoded = decoder.decode(
+                            payload,
+                            zHat.numel,
+                            entropy.zStartOffset,
+                            entropy.zPerChannelSize,
+                            yScales.map { EntropySymbols.indexesForScales(it) }.toTypedArray(),
+                        )
+                        require(decoded[0].contentEquals(EntropySymbols.zSymbols(zHat))) {
+                            "p rANS z roundtrip mismatch"
+                        }
+                        ySymbols.forEachIndexed { index, symbols ->
+                            require(decoded[index + 1].contentEquals(symbolBytes(symbols))) {
+                                "p rANS y stage=$index roundtrip mismatch"
+                            }
                         }
                     }
                 }
+                "PASS"
+            } else {
+                emit("large_p_codec_diagnostic stage=p_rans_roundtrip status=SKIPPED reason=external_p_cdf_missing")
+                "SKIPPED"
             }
             val decoderRuntime = runtime("p_decoder")
             val decoded = timed("p_decoder") {
@@ -168,8 +173,10 @@ class LargePEntropyCodecProbe(
                 outputRoot = outputRoot,
                 ctx = ctx,
                 ctxT = ctxT,
+                y = y,
                 zHat = zHat,
-                quantized = quantized,
+                ySymbols = ySymbols,
+                yScales = yScales,
                 yHat = yHat,
                 referenceFeature = decoded[0],
                 referenceFrame = decoded[1],
@@ -177,7 +184,7 @@ class LargePEntropyCodecProbe(
             )
             emit(
                 "large_p_codec_complete payload_bytes=${payload.size} payload_sha256=${sha256(payload)} " +
-                    "rans_roundtrip=PASS output=${outputRoot.absolutePath}",
+                    "rans_roundtrip=$roundtripStatus output=${outputRoot.absolutePath}",
             )
         } finally {
             runtimes.values.forEach(OfficialNeuronRuntime::close)
@@ -188,8 +195,10 @@ class LargePEntropyCodecProbe(
         outputRoot: File,
         ctx: TensorValue,
         ctxT: TensorValue,
+        y: TensorValue,
         zHat: TensorValue,
-        quantized: List<EntropyPriorStage>,
+        ySymbols: List<TensorValue>,
+        yScales: List<TensorValue>,
         yHat: TensorValue,
         referenceFeature: TensorValue,
         referenceFrame: TensorValue,
@@ -199,10 +208,11 @@ class LargePEntropyCodecProbe(
         val tensors = linkedMapOf<String, TensorValue>()
         tensors["p_ctx"] = ctx
         tensors["p_ctx_t"] = ctxT
+        tensors["p_y_pre_prior"] = y
         tensors["p_z_hat"] = zHat
-        quantized.forEachIndexed { index, stage ->
-            tensors["p_y_q_w_$index"] = stage.symbols
-            tensors["p_s_w_$index"] = stage.scales
+        ySymbols.forEachIndexed { index, symbols ->
+            tensors["p_y_q_w_$index"] = symbols
+            tensors["p_s_w_$index"] = yScales[index]
         }
         tensors["p_y_hat"] = yHat
         tensors["p_reference_feature"] = referenceFeature
@@ -279,11 +289,6 @@ class LargePEntropyCodecProbe(
         return CdfTable(values, rows, stride, lengths, offsets)
     }
 
-    private fun quantizeInt8(input: TensorValue, name: String): TensorValue =
-        TensorValue(name, input.shape, FloatArray(input.numel) { index ->
-            Math.rint(input.data[index].toDouble()).toInt().coerceIn(-128, 127).toFloat()
-        })
-
     private fun symbolBytes(symbols: TensorValue): ByteArray =
         ByteArray(symbols.numel) { index -> symbols.data[index].toInt().toByte() }
 
@@ -291,6 +296,33 @@ class LargePEntropyCodecProbe(
         val internal = context.filesDir.resolve("enterprise_tflite/large")
         val external = context.getExternalFilesDir(null)?.resolve("enterprise_tflite/large")
         return listOfNotNull(internal, external).firstOrNull { it.resolve(MANIFEST).isFile } ?: internal
+    }
+
+    private fun findPInputPath(packageRoot: File, entropyInfo: JSONObject?): String {
+        entropyInfo?.optString("input_p_frame")?.takeIf(String::isNotBlank)?.let { return it }
+        val inputManifest = packageRoot.resolve("input_manifest.json")
+        require(inputManifest.isFile) { "missing input_manifest.json: ${inputManifest.absolutePath}" }
+        val stages = JSONObject(inputManifest.readText()).getJSONArray("stages")
+        for (index in 0 until stages.length()) {
+            val stage = stages.getJSONObject(index)
+            if (stage.optString("model") != "p_encoder") continue
+            val inputs = stage.getJSONArray("inputs")
+            for (inputIndex in 0 until inputs.length()) {
+                val input = inputs.getJSONObject(inputIndex)
+                if (input.optString("name") == "input_p_frame") return input.getString("file")
+            }
+        }
+        error("input_manifest.json contains no P encoder frame input")
+    }
+
+    private fun findMergedModel(packageRoot: File, name: String): File {
+        val candidates = listOf(
+            packageRoot.resolve("models/$name"),
+            context.getExternalFilesDir(null)!!.resolve("enterprise_tflite_codec/large/$name"),
+            context.filesDir.resolve("enterprise_tflite/large/$name"),
+        )
+        return candidates.firstOrNull(File::isFile)
+            ?: error("missing $name; checked ${candidates.joinToString { it.absolutePath }}")
     }
 
     private fun <T> timed(label: String, block: () -> T): T {
@@ -302,6 +334,11 @@ class LargePEntropyCodecProbe(
 
     private fun elapsedMs(started: Long): Double =
         (SystemClock.elapsedRealtimeNanos() - started) / 1_000_000.0
+
+    private fun percentile(values: DoubleArray, fraction: Double): Double {
+        val sorted = values.sortedArray()
+        return sorted[((sorted.size - 1) * fraction).toInt().coerceIn(sorted.indices)]
+    }
 
     private fun sha256(file: File): String = FileInputStream(file).use { input ->
         val digest = MessageDigest.getInstance("SHA-256")
@@ -333,6 +370,7 @@ class LargePEntropyCodecProbe(
         val CTX_SHAPE = longArrayOf(1, 256, 32, 64)
         val Y_SHAPE = longArrayOf(1, 128, 16, 32)
         val Z_SHAPE = longArrayOf(1, 128, 4, 8)
-        val COMMON_SHAPE = longArrayOf(1, 384, 16, 32)
+        val PACKED_SHAPE = longArrayOf(1, 64, 16, 32)
+        const val ENCODER_MERGED_MODEL = "p_entropy_prior_merged_rans.tflite"
     }
 }

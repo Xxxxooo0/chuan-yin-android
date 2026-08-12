@@ -46,10 +46,50 @@ python server_tools/package_enterprise_dla_with_inputs.py --help
 
 ## Large 在线 entropy/prior
 
-I 帧只导出 `i_entropy_prior_merged_fp32.tflite`，不再部署旧的 7 张 I 分图。P 帧暂时
-使用 `export_entropy_offline_nhwc.py --candidates p_hyper_enc_continuous,...` 导出 4 张
-连续网络图。完整命令、独立模型文件和 Android 测试入口见
+I/P 编码侧分别由 `export_i_entropy_merged_nhwc.py`、`export_p_entropy_merged_nhwc.py`
+生成 prior 合图，再由 `append_i_rans_custom_op.py`、`append_p_rans_custom_op.py` 注入
+原生 rANS。I/P 解码侧生成串行 prior 基图后，由对应
+`append_*_rans_decode_custom_ops.py` 注入原生 rANS decode。正式 Android 路径不再使用
+旧的 I 7 张分图、P 4 张分图或旧解码多图。完整命令、独立模型文件和测试入口见
 [Large 在线部署](../docs/large-online-deployment.md)。
+
+## TFLite CPU 自定义算子分区探针
+
+`export_tflite_custom_op_partition_probe.py` 生成
+`Conv2D -> GVC_RT_CPU_IDENTITY -> Conv2D` 测试图，用于验证同一个 Interpreter
+能否在 Neuron 分区之间执行 CPU 自定义算子。该探针只验证运行机制，不包含真实 rANS。
+
+```bash
+python -u server_tools/export_tflite_custom_op_partition_probe.py \
+  --android-root /media/ltelab/D/weilingfeng/GVC-RT_clean_android \
+  --copy-assets
+```
+
+## I 帧 merged entropy + rANS 变体
+
+`append_i_rans_custom_op.py` 不重新导出神经网络，只在已经验证的
+`i_entropy_prior_merged.tflite` 尾部追加 CPU 自定义算子
+`GVC_RT_RANS_ENCODE`。CDF 常量写入模型，原 10 个输出保留，并新增固定容量 payload
+和实际 payload 长度。生成的 `i_entropy_prior_merged_rans.tflite` 是当前正式 I 编码
+entropy 模型，源 merged 文件只用于导出和验证。
+
+```bash
+python -u server_tools/append_i_rans_custom_op.py \
+  --merged-model outputs/i_entropy_merged_nhwc/i_entropy_prior_merged_fp32.tflite \
+  --entropy-package-dir outputs/gvc-rt-large_tflite_online_entropy_270p_qp0 \
+  --output outputs/i_entropy_merged_rans/i_entropy_prior_merged_rans.tflite
+```
+
+Android 将生成文件放入 Large 在线包的 `models/` 后，通过
+`--ez largeIEntropyCodecTest true` 运行正式 I 编码路径。
+
+## I 帧 merged entropy decoder + rANS 变体
+
+`export_i_entropy_decoder_merged_nhwc.py` 先导出以 `z_hat/y_q_w_0..3` 为占位输入的
+串行 prior 合图，并验证其与源码等价。`append_i_rans_decode_custom_ops.py` 再把这些输入
+替换为 `GVC_RT_RANS_DECODE_Z/Y` custom op，使最终模型只接收 payload buffer 和实际
+长度，输出 `z_hat`、四阶段符号/scales 和最终 `y_hat`。该变体用于减少四个 Interpreter
+之间的调度和 tensor 拷贝，rANS 仍由原生 CPU 执行。
 
 ## 结果审计
 
