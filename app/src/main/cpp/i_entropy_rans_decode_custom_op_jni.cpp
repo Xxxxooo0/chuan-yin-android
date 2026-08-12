@@ -93,11 +93,14 @@ struct Runtime {
     TfLiteRegistrationExternal* decodeZRegistration = nullptr;
     TfLiteRegistrationExternal* decodeYRegistration = nullptr;
     TfLiteInterpreter* interpreter = nullptr;
+    std::unique_ptr<DecodeState> decodeState;
+    int currentQp = 0;
 };
 
 TfliteApi* gApi = nullptr;
-std::unique_ptr<DecodeState> gDecodeState;
+Runtime* gActiveRuntime = nullptr;
 std::mutex gDecodeMutex;
+std::mutex gInvokeMutex;
 
 template <typename T>
 T loadSymbol(void* library, const char* name) {
@@ -239,18 +242,22 @@ std::shared_ptr<std::vector<uint8_t>> indexesFromNhwc(const float* scales) {
 TfLiteStatus decodeZInvoke(TfLiteOpaqueContext* context, TfLiteOpaqueNode* node) {
     std::lock_guard<std::mutex> lock(gDecodeMutex);
     try {
+        Runtime* runtime = gActiveRuntime;
+        if (runtime == nullptr || gApi != &runtime->api) {
+            throw std::runtime_error("rANS decode custom op has no active runtime");
+        }
         if (gApi == nullptr || gApi->opaqueInputCount(node) != 10 || gApi->opaqueOutputCount(node) != 1) {
             throw std::runtime_error("rANS Z custom op input/output count mismatch");
         }
         std::vector<const TfLiteOpaqueTensor*> inputs;
         for (int index = 0; index < 10; ++index) inputs.push_back(inputTensor(context, node, index));
-        if (!gDecodeState) {
+        if (!runtime->decodeState) {
             const CdfData gaussian = copyCdf(inputs[2], inputs[3], inputs[4]);
             const CdfData z = copyCdf(inputs[5], inputs[6], inputs[7]);
             const int startOffset = data<int32_t>(inputs[8])[0];
             const int perChannelSize = data<int32_t>(inputs[9])[0];
             if (perChannelSize <= 0) throw std::runtime_error("invalid z per-channel size");
-            gDecodeState = std::make_unique<DecodeState>(gaussian, z, startOffset, perChannelSize);
+            runtime->decodeState = std::make_unique<DecodeState>(gaussian, z, startOffset, perChannelSize);
         }
         const int32_t payloadSize = data<int32_t>(inputs[1])[0];
         const size_t payloadCapacity = gApi->opaqueByteSize(inputs[0]);
@@ -258,11 +265,12 @@ TfLiteStatus decodeZInvoke(TfLiteOpaqueContext* context, TfLiteOpaqueNode* node)
             throw std::runtime_error("invalid rANS payload size");
         }
         const uint8_t* payload = data<uint8_t>(inputs[0]);
-        gDecodeState->decoder.set_stream(
+        runtime->decodeState->decoder.set_stream(
             std::make_shared<std::vector<uint8_t>>(payload, payload + payloadSize));
-        gDecodeState->decoder.decode_z(1 * 128 * 4 * 8, gDecodeState->zGroup,
-                                      gDecodeState->zStartOffset, gDecodeState->zPerChannelSize);
-        auto symbols = gDecodeState->decoder.get_decoded_tensor();
+        runtime->decodeState->decoder.decode_z(1 * 128 * 4 * 8, runtime->decodeState->zGroup,
+                                               runtime->currentQp * 128,
+                                               runtime->decodeState->zPerChannelSize);
+        auto symbols = runtime->decodeState->decoder.get_decoded_tensor();
         TfLiteOpaqueTensor* output = outputTensor(context, node, 0);
         if (gApi->opaqueByteSize(output) != symbols->size() * sizeof(float)) {
             throw std::runtime_error("rANS Z output byte size mismatch");
@@ -278,7 +286,11 @@ TfLiteStatus decodeZInvoke(TfLiteOpaqueContext* context, TfLiteOpaqueNode* node)
 TfLiteStatus decodeYInvoke(TfLiteOpaqueContext* context, TfLiteOpaqueNode* node) {
     std::lock_guard<std::mutex> lock(gDecodeMutex);
     try {
-        if (gApi == nullptr || !gDecodeState || gApi->opaqueInputCount(node) != 4 ||
+        Runtime* runtime = gActiveRuntime;
+        if (runtime == nullptr || gApi != &runtime->api) {
+            throw std::runtime_error("rANS decode custom op has no active runtime");
+        }
+        if (gApi == nullptr || !runtime->decodeState || gApi->opaqueInputCount(node) != 4 ||
             gApi->opaqueOutputCount(node) != 1) {
             throw std::runtime_error("rANS Y custom op state or input/output count mismatch");
         }
@@ -286,8 +298,9 @@ TfLiteStatus decodeYInvoke(TfLiteOpaqueContext* context, TfLiteOpaqueNode* node)
         if (gApi->opaqueByteSize(scales) != static_cast<size_t>(1 * 16 * 32 * 64 * sizeof(float))) {
             throw std::runtime_error("rANS Y scales byte size mismatch");
         }
-        gDecodeState->decoder.decode_y(indexesFromNhwc(data<float>(scales)), gDecodeState->gaussianGroup);
-        auto symbols = gDecodeState->decoder.get_decoded_tensor();
+        runtime->decodeState->decoder.decode_y(
+            indexesFromNhwc(data<float>(scales)), runtime->decodeState->gaussianGroup);
+        auto symbols = runtime->decodeState->decoder.get_decoded_tensor();
         TfLiteOpaqueTensor* output = outputTensor(context, node, 0);
         if (gApi->opaqueByteSize(output) != symbols->size() * sizeof(float)) {
             throw std::runtime_error("rANS Y output byte size mismatch");
@@ -307,11 +320,6 @@ void destroyRuntime(Runtime* runtime) {
     if (runtime->decodeYRegistration != nullptr) runtime->api.registrationDelete(runtime->decodeYRegistration);
     if (runtime->options != nullptr) runtime->api.optionsDelete(runtime->options);
     if (runtime->model != nullptr) runtime->api.modelDelete(runtime->model);
-    {
-        std::lock_guard<std::mutex> lock(gDecodeMutex);
-        gDecodeState.reset();
-        gApi = nullptr;
-    }
     if (runtime->api.library != nullptr) dlclose(runtime->api.library);
     delete runtime;
 }
@@ -326,7 +334,6 @@ Runtime* createRuntime(
     if (delegate == nullptr) throw std::runtime_error("Neuron delegate handle is null");
     auto runtime = std::make_unique<Runtime>();
     runtime->api = loadApi();
-    gApi = &runtime->api;
     try {
         runtime->model = runtime->api.modelCreateFromFile(path.c_str());
         if (runtime->model == nullptr) throw std::runtime_error("TfLiteModelCreateFromFile failed");
@@ -357,6 +364,16 @@ Runtime* createRuntime(
     }
 }
 
+TfLiteStatus invokeRuntime(Runtime* runtime) {
+    std::lock_guard<std::mutex> lock(gInvokeMutex);
+    gActiveRuntime = runtime;
+    gApi = &runtime->api;
+    const TfLiteStatus status = runtime->api.invoke(runtime->interpreter);
+    gApi = nullptr;
+    gActiveRuntime = nullptr;
+    return status;
+}
+
 void copyJavaInput(JNIEnv* env, Runtime* runtime, int index, jbyteArray input) {
     if (input == nullptr) throw std::runtime_error("merged entropy decoder input is null");
     TfLiteTensor* tensor = runtime->api.inputTensor(runtime->interpreter, index);
@@ -376,8 +393,11 @@ jobjectArray runRuntime(
     Runtime* runtime,
     jbyteArray payload,
     jbyteArray contextInput,
+    jint qp,
     jint outputMode) {
     if (runtime == nullptr) throw std::runtime_error("merged entropy decoder is closed");
+    if (qp < 0 || qp > 9) throw std::runtime_error("entropy decoder QP must be in [0,9]");
+    runtime->currentQp = qp;
     TfLiteTensor* payloadTensor = runtime->api.inputTensor(runtime->interpreter, 0);
     TfLiteTensor* sizeTensor = runtime->api.inputTensor(runtime->interpreter, 1);
     const size_t capacity = runtime->api.tensorByteSize(payloadTensor);
@@ -393,7 +413,7 @@ jobjectArray runRuntime(
         throw std::runtime_error("merged entropy decoder payload copy failed");
     }
     if (contextInput != nullptr) copyJavaInput(env, runtime, 2, contextInput);
-    if (runtime->api.invoke(runtime->interpreter) != kTfLiteOk) {
+    if (invokeRuntime(runtime) != kTfLiteOk) {
         throw std::runtime_error("merged entropy decoder invoke failed");
     }
     jclass byteArrayClass = env->FindClass("[B");
@@ -453,9 +473,9 @@ Java_com_gvcrt_clean_IEntropyRansDecodeMergedRuntime_nativeCreate(
 
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_com_gvcrt_clean_IEntropyRansDecodeMergedRuntime_nativeRun(
-    JNIEnv* env, jclass, jlong handle, jbyteArray payload, jint outputMode) {
+    JNIEnv* env, jclass, jlong handle, jbyteArray payload, jint qp, jint outputMode) {
     try {
-        return runRuntime(env, reinterpret_cast<Runtime*>(handle), payload, nullptr, outputMode);
+        return runRuntime(env, reinterpret_cast<Runtime*>(handle), payload, nullptr, qp, outputMode);
     } catch (const std::exception& error) {
         throwJava(env, error.what());
         return nullptr;
@@ -496,9 +516,10 @@ Java_com_gvcrt_clean_PEntropyRansDecodeMergedRuntime_nativeRun(
     jlong handle,
     jbyteArray payload,
     jbyteArray ctxT,
+    jint qp,
     jint outputMode) {
     try {
-        return runRuntime(env, reinterpret_cast<Runtime*>(handle), payload, ctxT, outputMode);
+        return runRuntime(env, reinterpret_cast<Runtime*>(handle), payload, ctxT, qp, outputMode);
     } catch (const std::exception& error) {
         throwJava(env, error.what());
         return nullptr;

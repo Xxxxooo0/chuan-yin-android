@@ -10,16 +10,16 @@ class PEntropyRansMergedRuntime private constructor(
     val optionsSummary: String,
 ) : AutoCloseable {
     @Synchronized
-    fun run(y: ByteArray, ctxT: ByteArray, copyOutputs: Boolean = true): List<ByteArray> {
+    fun run(y: ByteArray, ctxT: ByteArray, copyOutputs: Boolean = true, qp: Int = 0): List<ByteArray> {
         check(nativeHandle != 0L) { "P merged rANS runtime is closed" }
-        return nativeRun(nativeHandle, y, ctxT, if (copyOutputs) OUTPUT_ALL else OUTPUT_NONE).toList()
+        return nativeRun(nativeHandle, y, ctxT, qp, if (copyOutputs) OUTPUT_ALL else OUTPUT_NONE).toList()
     }
 
     /** Returns P y_hat and the trimmed rANS payload. */
     @Synchronized
-    fun runCanonical(y: ByteArray, ctxT: ByteArray, copyOutputs: Boolean = true): List<ByteArray> {
+    fun runCanonical(y: ByteArray, ctxT: ByteArray, copyOutputs: Boolean = true, qp: Int = 0): List<ByteArray> {
         check(nativeHandle != 0L) { "P merged rANS runtime is closed" }
-        return nativeRun(nativeHandle, y, ctxT, if (copyOutputs) OUTPUT_CANONICAL else OUTPUT_NONE).toList()
+        return nativeRun(nativeHandle, y, ctxT, qp, if (copyOutputs) OUTPUT_CANONICAL else OUTPUT_NONE).toList()
     }
 
     override fun close() {
@@ -70,6 +70,7 @@ class PEntropyRansMergedRuntime private constructor(
             handle: Long,
             y: ByteArray,
             ctxT: ByteArray,
+            qp: Int,
             outputMode: Int,
         ): Array<ByteArray>
 

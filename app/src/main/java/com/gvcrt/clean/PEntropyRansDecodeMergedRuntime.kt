@@ -10,16 +10,16 @@ class PEntropyRansDecodeMergedRuntime private constructor(
     val optionsSummary: String,
 ) : AutoCloseable {
     @Synchronized
-    fun run(payload: ByteArray, ctxT: ByteArray, copyOutputs: Boolean = true): List<ByteArray> {
+    fun run(payload: ByteArray, ctxT: ByteArray, copyOutputs: Boolean = true, qp: Int = 0): List<ByteArray> {
         check(nativeHandle != 0L) { "P merged entropy decoder is closed" }
-        return nativeRun(nativeHandle, payload, ctxT, if (copyOutputs) OUTPUT_ALL else OUTPUT_NONE).toList()
+        return nativeRun(nativeHandle, payload, ctxT, qp, if (copyOutputs) OUTPUT_ALL else OUTPUT_NONE).toList()
     }
 
     /** Returns only P y_hat while executing the full serial entropy decode. */
     @Synchronized
-    fun runCanonical(payload: ByteArray, ctxT: ByteArray): ByteArray {
+    fun runCanonical(payload: ByteArray, ctxT: ByteArray, qp: Int = 0): ByteArray {
         check(nativeHandle != 0L) { "P merged entropy decoder is closed" }
-        return nativeRun(nativeHandle, payload, ctxT, OUTPUT_CANONICAL).single()
+        return nativeRun(nativeHandle, payload, ctxT, qp, OUTPUT_CANONICAL).single()
     }
 
     override fun close() {
@@ -71,6 +71,7 @@ class PEntropyRansDecodeMergedRuntime private constructor(
             handle: Long,
             payload: ByteArray,
             ctxT: ByteArray,
+            qp: Int,
             outputMode: Int,
         ): Array<ByteArray>
 

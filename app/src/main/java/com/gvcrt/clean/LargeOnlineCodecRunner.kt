@@ -13,7 +13,7 @@ import java.util.Locale
 import kotlin.math.log10
 import kotlin.math.sqrt
 
-/** Canonical Large online path: three input frames -> GVC stream -> independent reconstruction. */
+/** Canonical Large online path: input frames -> GVC stream -> independent reconstruction. */
 class LargeOnlineCodecRunner(
     private val context: Context,
     private val emit: (String) -> Unit,
@@ -21,28 +21,173 @@ class LargeOnlineCodecRunner(
 ) : AutoCloseable {
     private var prepared: PreparedRuntimes? = null
 
-    fun run(imagePath: String?, warmupRuns: Int = 1, measuredRuns: Int = 1) {
-        require(warmupRuns >= 0 && measuredRuns > 0)
+    fun run(imagePath: String?, warmupRuns: Int = 1, measuredRuns: Int = 1, qp: Int = 0) {
         val image = ImageTensorLoader.load(context, imagePath)
         val displayInput = image.tensor.renamed("input_frame")
-        val frame = NhwcTensorCodec.toF32Le(displayInput)
-        val frames = List(FRAME_COUNT) { frame }
-        val runtimes = prepare()
+        runFrames(
+            frames = List(DEFAULT_FRAME_COUNT) { NhwcTensorCodec.toF32Le(displayInput) },
+            source = image.source,
+            outputName = "three_frame",
+            warmupRuns = warmupRuns,
+            measuredRuns = measuredRuns,
+            qp = qp,
+        )
+    }
+
+    fun runSequence(
+        sequenceDir: String,
+        frameCount: Int,
+        warmupRuns: Int = 0,
+        measuredRuns: Int = 1,
+        dumpPEntropyBoundaries: Boolean = false,
+        qp: Int = 0,
+    ) {
+        require(frameCount > 0) { "Large online video frame count must be positive" }
+        val directory = File(sequenceDir)
+        require(directory.isDirectory) { "Large online video directory does not exist: ${directory.absolutePath}" }
+        val frameFiles = directory.listFiles()
+            ?.filter { it.isFile && it.extension.equals("png", ignoreCase = true) }
+            ?.sortedBy { it.name }
+            ?.take(frameCount)
+            .orEmpty()
+        require(frameFiles.size == frameCount) {
+            "Large online video requires $frameCount PNG frames, found ${frameFiles.size} in ${directory.absolutePath}"
+        }
+        emit("large_online_video_load_start directory=${directory.absolutePath} frames=$frameCount")
+        runSequenceFiles(
+            frameFiles = frameFiles,
+            source = directory.absolutePath,
+            outputName = "sequence_${frameCount}_frames",
+            warmupRuns = warmupRuns,
+            measuredRuns = measuredRuns,
+            dumpPEntropyBoundaries = dumpPEntropyBoundaries,
+            qp = qp,
+        )
+    }
+
+    private fun runSequenceFiles(
+        frameFiles: List<File>,
+        source: String,
+        outputName: String,
+        warmupRuns: Int,
+        measuredRuns: Int,
+        dumpPEntropyBoundaries: Boolean,
+        qp: Int,
+    ) {
+        require(frameFiles.isNotEmpty())
+        require(warmupRuns >= 0 && measuredRuns > 0)
+        val runtimes = prepare(qp)
+        fun loadFrame(index: Int): ByteArray {
+            val tensor = ImageTensorLoader.load(context, frameFiles[index].absolutePath)
+                .tensor
+                .renamed("input_frame_$index")
+            return NhwcTensorCodec.toF32Le(tensor)
+        }
         emit(
-            "large_online_main_start source=${image.source} frames=$FRAME_COUNT pattern=I,P,P " +
+            "large_online_main_start source=$source frames=${frameFiles.size} pattern=I,Px${frameFiles.size - 1} " +
+                "qp=${runtimes.stream.qp} layout=NHWC io=FP32 model_input_range=-1_1 " +
+                "warmup=$warmupRuns measured=$measuredRuns sequence_mode=streaming " +
+                "reference_reset_interval=$REFERENCE_RESET_INTERVAL",
+        )
+        repeat(warmupRuns) {
+            execute(
+                inputCount = frameFiles.size,
+                inputAt = ::loadFrame,
+                runtimes = runtimes,
+                collectTimings = false,
+                retainDecodedFrames = false,
+            )
+        }
+        val results = ArrayList<SequenceRunResult>(measuredRuns)
+        repeat(measuredRuns) {
+            val psnrs = ArrayList<Double>(frameFiles.size)
+            var lastDecoded: ByteArray? = null
+            val result = execute(
+                inputCount = frameFiles.size,
+                inputAt = ::loadFrame,
+                runtimes = runtimes,
+                collectTimings = true,
+                retainDecodedFrames = false,
+                decodedConsumer = { index, decoded ->
+                    psnrs += calculatePsnr(loadFrame(index), decoded)
+                    if (index == frameFiles.lastIndex) lastDecoded = decoded
+                },
+                pEntropyBoundaryFrames = if (dumpPEntropyBoundaries) setOf(1, 2) else emptySet(),
+            )
+            results += SequenceRunResult(result, psnrs, lastDecoded ?: error("missing final decoded frame"))
+        }
+        emitSummary(results.map(SequenceRunResult::run), frameFiles.size)
+
+        val result = results.last()
+        val outputRoot = context.getExternalFilesDir(null)!!
+            .resolve("enterprise_tflite_codec/large/main/$outputName")
+        outputRoot.mkdirs()
+        val firstInput = loadFrame(0)
+        val lastInput = loadFrame(frameFiles.lastIndex)
+        val inputFile = outputRoot.resolve("input_frame_000.nhwc.f32le").apply { writeBytes(firstInput) }
+        val streamFile = outputRoot.resolve("encoded_${frameFiles.size}_frames.gvc").apply {
+            writeBytes(result.run.stream)
+        }
+        outputRoot.resolve("decoded_frame_${frameFiles.lastIndex.toString().padStart(3, '0')}.nhwc.f32le")
+            .writeBytes(result.lastDecoded)
+        val boundaryRoot = outputRoot.resolve("boundaries").apply { mkdirs() }
+        result.run.iBoundaries.forEach { (name, bytes) ->
+            boundaryRoot.resolve("$name.nhwc.f32le").writeBytes(bytes)
+            emit("large_online_main_boundary name=$name bytes=${bytes.size} sha256=${sha256(bytes)}")
+        }
+        result.psnrs.forEachIndexed { index, psnr ->
+            emit(
+                "large_online_main_quality frame=${index + 1} type=${if (index == 0) "I" else "P"} " +
+                    "psnr_db=${format(psnr)}",
+            )
+        }
+        val inputTensor = NhwcTensorCodec.fromF32Le("input_frame", FRAME_SHAPE, lastInput)
+        val outputTensor = NhwcTensorCodec.fromF32Le("decoded_frame", FRAME_SHAPE, result.lastDecoded)
+        val finalPsnr = result.psnrs.last()
+        val inputPng = writeTensorPng(inputTensor, "large_online_input.png")
+        val outputPng = writeTensorPng(outputTensor, "large_online_reconstruction.png")
+        showImages?.invoke(inputPng, outputPng, finalPsnr)
+        emit(
+            "large_online_main_output stream=${streamFile.absolutePath} bytes=${result.run.stream.size} " +
+                "sha256=${sha256(result.run.stream)} final_psnr_db=${format(finalPsnr)} " +
+                "mean_psnr_db=${format(result.psnrs.average())} min_psnr_db=${format(result.psnrs.minOrNull()!!)} " +
+                "input=${inputFile.absolutePath} input_sha256=${sha256(firstInput)} " +
+                "reconstruction=${outputPng.absolutePath} dump_mode=streaming_final_frame_only",
+        )
+        emit("large_online_main_complete status=PASS all_models_exercised=true")
+    }
+
+    private fun runFrames(
+        frames: List<ByteArray>,
+        source: String,
+        outputName: String,
+        warmupRuns: Int,
+        measuredRuns: Int,
+        qp: Int,
+    ) {
+        require(frames.isNotEmpty())
+        require(warmupRuns >= 0 && measuredRuns > 0)
+        val runtimes = prepare(qp)
+        emit(
+            "large_online_main_start source=$source frames=${frames.size} pattern=I,Px${frames.size - 1} " +
                 "qp=${runtimes.stream.qp} layout=NHWC io=FP32 model_input_range=-1_1 " +
                 "warmup=$warmupRuns measured=$measuredRuns",
         )
-        repeat(warmupRuns) { execute(frames, runtimes, collectTimings = false) }
+        repeat(warmupRuns) {
+            execute(frames.size, frames::get, runtimes, collectTimings = false)
+        }
         val results = ArrayList<RunResult>(measuredRuns)
-        repeat(measuredRuns) { results += execute(frames, runtimes, collectTimings = true) }
-        emitSummary(results)
+        repeat(measuredRuns) {
+            results += execute(frames.size, frames::get, runtimes, collectTimings = true)
+        }
+        emitSummary(results, frames.size)
 
         val result = results.last()
-        val outputRoot = context.getExternalFilesDir(null)!!.resolve("enterprise_tflite_codec/large/main")
+        val outputRoot = context.getExternalFilesDir(null)!!
+            .resolve("enterprise_tflite_codec/large/main/$outputName")
         outputRoot.mkdirs()
-        val inputFile = outputRoot.resolve("input_frame.nhwc.f32le").apply { writeBytes(frame) }
-        val streamFile = outputRoot.resolve("encoded_i_p_p.gvc").apply { writeBytes(result.stream) }
+        val inputFile = outputRoot.resolve("input_frame_000.nhwc.f32le").apply { writeBytes(frames.first()) }
+        val streamFile = outputRoot.resolve("encoded_${frames.size}_frames.gvc").apply { writeBytes(result.stream) }
         val boundaryRoot = outputRoot.resolve("boundaries").apply { mkdirs() }
         result.iBoundaries.forEach { (name, bytes) ->
             boundaryRoot.resolve("$name.nhwc.f32le").writeBytes(bytes)
@@ -52,12 +197,14 @@ class LargeOnlineCodecRunner(
             outputRoot.resolve("decoded_frame_${index.toString().padStart(3, '0')}.nhwc.f32le").writeBytes(bytes)
         }
         val framePsnr = frames.indices.map { index ->
-            val output = NhwcTensorCodec.fromF32Le("decoded_frame_$index", FRAME_SHAPE, result.decodedFrames[index])
-            calculatePsnr(displayInput, output).also { psnr ->
-                emit("large_online_main_quality frame=$index type=${if (index == 0) "I" else "P"} psnr_db=${format(psnr)}")
+            calculatePsnr(frames[index], result.decodedFrames[index]).also { psnr ->
+                emit(
+                    "large_online_main_quality frame=${index + 1} type=${if (index == 0) "I" else "P"} " +
+                        "psnr_db=${format(psnr)}",
+                )
             }
         }
-        val inputTensor = displayInput
+        val inputTensor = NhwcTensorCodec.fromF32Le("input_frame", FRAME_SHAPE, frames.last())
         val outputTensor = NhwcTensorCodec.fromF32Le("decoded_frame", FRAME_SHAPE, result.decodedFrames.last())
         val psnr = framePsnr.last()
         val inputPng = writeTensorPng(inputTensor, "large_online_input.png")
@@ -66,18 +213,25 @@ class LargeOnlineCodecRunner(
         emit(
             "large_online_main_output stream=${streamFile.absolutePath} bytes=${result.stream.size} " +
                 "sha256=${sha256(result.stream)} final_psnr_db=${format(psnr)} " +
-                "input=${inputFile.absolutePath} input_sha256=${sha256(frame)} " +
+                "mean_psnr_db=${format(framePsnr.average())} min_psnr_db=${format(framePsnr.minOrNull()!!)} " +
+                "input=${inputFile.absolutePath} input_sha256=${sha256(frames.first())} " +
                 "reconstruction=${outputPng.absolutePath}",
         )
         emit("large_online_main_complete status=PASS all_models_exercised=true")
     }
 
     private fun execute(
-        inputs: List<ByteArray>,
+        inputCount: Int,
+        inputAt: (Int) -> ByteArray,
         runtimes: PreparedRuntimes,
         collectTimings: Boolean,
+        retainDecodedFrames: Boolean = true,
+        decodedConsumer: ((Int, ByteArray) -> Unit)? = null,
+        pEntropyBoundaryFrames: Set<Int> = emptySet(),
     ): RunResult {
+        require(inputCount > 0)
         val timings = linkedMapOf<String, Long>()
+        var excludedNs = 0L
         fun <T> timed(name: String, block: () -> T): T {
             if (!collectTimings) return block()
             val started = SystemClock.elapsedRealtimeNanos()
@@ -85,82 +239,167 @@ class LargeOnlineCodecRunner(
         }
 
         val totalStarted = SystemClock.elapsedRealtimeNanos()
-        val payloads = ArrayList<GvcFramePayload>(inputs.size)
-        val encoderReconstructions = ArrayList<ByteArray>(inputs.size)
+        val payloads = ArrayList<GvcFramePayload>(inputCount)
+        val encoderReconstructionHashes = ArrayList<String>(inputCount)
+        val pEntropyFrameTimes = ArrayList<Long>((inputCount - 1).coerceAtLeast(0))
         val iBoundaries = linkedMapOf<String, ByteArray>()
         var encoderReferenceFrame: ByteArray? = null
         var encoderReferenceFeature: ByteArray? = null
 
-        inputs.forEachIndexed { index, input ->
+        repeat(inputCount) { index ->
+            val loadStarted = SystemClock.elapsedRealtimeNanos()
+            val input = inputAt(index)
+            if (collectTimings) excludedNs += elapsedNs(loadStarted)
             if (index == 0) {
-                val y = timed("encode_i_encoder") { runtimes.iEncoder.run(listOf(input)).single() }
-                val entropy = timed("encode_i_entropy_rans") { runtimes.iEntropyEncoder.runCanonical(y) }
+                val y = timed("encode_i_encoder") {
+                    runtimes.iEncoder.run(runtimes.neuralInputs(listOf(input), "i_q_enc")).single()
+                }
+                val entropy = timed("encode_i_entropy_rans") {
+                    runtimes.iEntropyEncoder.runCanonical(y, qp = runtimes.stream.qp)
+                }
                 require(entropy.size == 2) { "I entropy canonical outputs=${entropy.size}" }
                 if (collectTimings) {
                     iBoundaries["android_i_y_pre_prior"] = y
                     iBoundaries["android_i_y_hat_encode"] = entropy[0]
                 }
                 val reconstruction = timed("encode_i_decoder") {
-                    runtimes.iDecoder.run(listOf(entropy[0])).single()
+                    runtimes.iDecoder.run(
+                        runtimes.neuralInputs(listOf(entropy[0]), "i_q_dec", "i_q_recon"),
+                    ).single()
                 }
                 payloads += GvcFramePayload(true, entropy[1])
-                encoderReconstructions += reconstruction
+                encoderReconstructionHashes += sha256(reconstruction)
                 encoderReferenceFrame = reconstruction
             } else {
-                val temporal = timed(if (index == 1) "encode_temporal_from_frame" else "encode_temporal_from_feature") {
-                    if (index == 1) {
-                        runtimes.temporalFromFrame.run(listOf(encoderReferenceFrame ?: error("missing encoder I reference")))
+                val resetReference = shouldResetReference(index)
+                val temporal = timed(if (resetReference) "encode_temporal_from_frame" else "encode_temporal_from_feature") {
+                    if (resetReference) {
+                        runtimes.temporalFromFrame.run(
+                            runtimes.neuralInputs(
+                                listOf(encoderReferenceFrame ?: error("missing encoder I reference")),
+                                "p_q_feature",
+                            ),
+                        )
                     } else {
                         runtimes.temporalFromFeature.run(
-                            listOf(encoderReferenceFeature ?: error("missing encoder P reference feature")),
+                            runtimes.neuralInputs(
+                                listOf(encoderReferenceFeature ?: error("missing encoder P reference feature")),
+                                "p_q_feature",
+                            ),
                         )
                     }
                 }
                 require(temporal.size == 3) { "encoder temporal outputs=${temporal.size}" }
                 val ctx = temporal[1]
                 val ctxT = temporal[2]
-                val y = timed("encode_p_encoder") { runtimes.pEncoder.run(listOf(input, ctx)).single() }
-                val entropy = timed("encode_p_entropy_rans") {
-                    runtimes.pEntropyEncoder.runCanonical(y, ctxT)
+                val y = timed("encode_p_encoder") {
+                    runtimes.pEncoder.run(runtimes.neuralInputs(listOf(input, ctx), "p_q_enc")).single()
+                }
+                val entropyStarted = SystemClock.elapsedRealtimeNanos()
+                val entropy = if (index in pEntropyBoundaryFrames) {
+                    val outputs = runtimes.pEntropyEncoder.run(y, ctxT, qp = runtimes.stream.qp)
+                    require(outputs.size == 8) { "P entropy diagnostic outputs=${outputs.size}" }
+                    val payloadSize = java.nio.ByteBuffer.wrap(outputs[7])
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        .int
+                    require(payloadSize in 0..outputs[6].size) { "invalid P diagnostic payload size=$payloadSize" }
+                    val prefix = "android_p_frame_${(index + 1).toString().padStart(3, '0')}"
+                    iBoundaries["${prefix}_y_pre_prior"] = y
+                    iBoundaries["${prefix}_ctx"] = ctx
+                    iBoundaries["${prefix}_ctx_t"] = ctxT
+                    iBoundaries["${prefix}_z_hat"] = outputs[0]
+                    iBoundaries["${prefix}_y_q_w_0"] = outputs[1]
+                    iBoundaries["${prefix}_y_q_w_1"] = outputs[2]
+                    iBoundaries["${prefix}_s_w_0"] = outputs[3]
+                    iBoundaries["${prefix}_s_w_1"] = outputs[4]
+                    iBoundaries["${prefix}_y_hat"] = outputs[5]
+                    iBoundaries["${prefix}_rans_payload"] = outputs[6].copyOf(payloadSize)
+                    listOf(outputs[5], outputs[6].copyOf(payloadSize))
+                } else {
+                    runtimes.pEntropyEncoder.runCanonical(y, ctxT, qp = runtimes.stream.qp)
+                }
+                if (collectTimings) {
+                    val entropyNs = elapsedNs(entropyStarted)
+                    timings["encode_p_entropy_rans"] =
+                        (timings["encode_p_entropy_rans"] ?: 0L) + entropyNs
+                    pEntropyFrameTimes += entropyNs
+                    if (index == 1 || resetReference || index % P_ENTROPY_LOG_INTERVAL == 0 || index == inputCount - 1) {
+                        emit(
+                            "large_online_p_entropy_progress frame=${index + 1} " +
+                                "reference=${if (resetReference) "frame" else "feature"} " +
+                                "elapsed_ms=${format(entropyNs / 1_000_000.0)} payload_bytes=${entropy[1].size}",
+                        )
+                    }
                 }
                 require(entropy.size == 2) { "P entropy canonical outputs=${entropy.size}" }
                 val reconstruction = timed("encode_p_decoder") {
-                    runtimes.pDecoder.run(listOf(entropy[0], ctx))
+                    runtimes.pDecoder.run(
+                        runtimes.neuralInputs(listOf(entropy[0], ctx), "p_q_dec", "p_q_recon"),
+                    )
                 }
                 require(reconstruction.size == 2) { "encoder P decoder outputs=${reconstruction.size}" }
                 payloads += GvcFramePayload(false, entropy[1])
                 encoderReferenceFeature = reconstruction[0]
-                encoderReconstructions += reconstruction[1]
+                encoderReferenceFrame = reconstruction[1]
+                encoderReconstructionHashes += sha256(reconstruction[1])
             }
+        }
+        if (collectTimings && pEntropyFrameTimes.isNotEmpty()) {
+            emit(
+                "large_online_p_entropy_distribution frames=${pEntropyFrameTimes.size} " +
+                    "mean_ms=${format(pEntropyFrameTimes.average() / 1_000_000.0)} " +
+                    "p50_ms=${format(percentile(pEntropyFrameTimes, 0.50) / 1_000_000.0)} " +
+                    "p90_ms=${format(percentile(pEntropyFrameTimes, 0.90) / 1_000_000.0)} " +
+                    "max_ms=${format((pEntropyFrameTimes.maxOrNull() ?: 0L) / 1_000_000.0)}",
+            )
         }
 
         val stream = timed("stream_mux") { GvcStreamMuxer.muxSequence(runtimes.stream, payloads) }
         val parsed = timed("stream_demux") { GvcStreamMuxer.demuxSequence(stream) }
-        require(parsed.frames.size == inputs.size) { "decoded frame count=${parsed.frames.size}" }
+        require(parsed.frames.size == inputCount) { "decoded frame count=${parsed.frames.size}" }
         require(parsed.stream.qp == runtimes.stream.qp) { "decoded QP=${parsed.stream.qp}" }
 
-        val decodedFrames = ArrayList<ByteArray>(parsed.frames.size)
+        val decodedFrames = ArrayList<ByteArray>(if (retainDecodedFrames) parsed.frames.size else 0)
         var decoderReferenceFrame: ByteArray? = null
         var decoderReferenceFeature: ByteArray? = null
         parsed.frames.forEachIndexed { index, framePayload ->
             if (framePayload.isIFrame) {
                 require(index == 0) { "I payload must be frame zero" }
                 val yHat = timed("decode_i_entropy_rans") {
-                    runtimes.iEntropyDecoder.runCanonical(framePayload.payload)
+                    runtimes.iEntropyDecoder.runCanonical(framePayload.payload, qp = runtimes.stream.qp)
                 }
                 if (collectTimings) iBoundaries["android_i_y_hat_decode"] = yHat
                 val reconstruction = timed("decode_i_decoder") {
-                    runtimes.iDecoder.run(listOf(yHat)).single()
+                    runtimes.iDecoder.run(
+                        runtimes.neuralInputs(listOf(yHat), "i_q_dec", "i_q_recon"),
+                    ).single()
                 }
                 decoderReferenceFrame = reconstruction
-                decodedFrames += reconstruction
+                require(encoderReconstructionHashes[index] == sha256(reconstruction)) {
+                    "encoder/decoder reconstruction mismatch at frame=$index"
+                }
+                if (retainDecodedFrames) decodedFrames += reconstruction
+                if (decodedConsumer != null) {
+                    val consumerStarted = SystemClock.elapsedRealtimeNanos()
+                    decodedConsumer(index, reconstruction)
+                    if (collectTimings) excludedNs += elapsedNs(consumerStarted)
+                }
             } else {
-                val temporal = timed(if (index == 1) "decode_temporal_from_frame" else "decode_temporal_from_feature") {
-                    if (index == 1) {
-                        runtimes.temporalFromFrame.run(listOf(decoderReferenceFrame ?: error("missing decoder I reference")))
+                val resetReference = shouldResetReference(index)
+                val temporal = timed(if (resetReference) "decode_temporal_from_frame" else "decode_temporal_from_feature") {
+                    if (resetReference) {
+                        runtimes.temporalFromFrame.run(
+                            runtimes.neuralInputs(
+                                listOf(decoderReferenceFrame ?: error("missing decoder I reference")),
+                                "p_q_feature",
+                            ),
+                        )
                     } else {
                         runtimes.temporalFromFeature.run(
-                            listOf(decoderReferenceFeature ?: error("missing decoder P reference feature")),
+                            runtimes.neuralInputs(
+                                listOf(decoderReferenceFeature ?: error("missing decoder P reference feature")),
+                                "p_q_feature",
+                            ),
                         )
                     }
                 }
@@ -168,41 +407,67 @@ class LargeOnlineCodecRunner(
                 val ctx = temporal[1]
                 val ctxT = temporal[2]
                 val yHat = timed("decode_p_entropy_rans") {
-                    runtimes.pEntropyDecoder.runCanonical(framePayload.payload, ctxT)
+                    runtimes.pEntropyDecoder.runCanonical(
+                        framePayload.payload,
+                        ctxT,
+                        qp = runtimes.stream.qp,
+                    )
                 }
                 val reconstruction = timed("decode_p_decoder") {
-                    runtimes.pDecoder.run(listOf(yHat, ctx))
+                    runtimes.pDecoder.run(
+                        runtimes.neuralInputs(listOf(yHat, ctx), "p_q_dec", "p_q_recon"),
+                    )
                 }
                 require(reconstruction.size == 2) { "decoded P outputs=${reconstruction.size}" }
                 decoderReferenceFeature = reconstruction[0]
-                decodedFrames += reconstruction[1]
+                decoderReferenceFrame = reconstruction[1]
+                require(encoderReconstructionHashes[index] == sha256(reconstruction[1])) {
+                    "encoder/decoder reconstruction mismatch at frame=$index"
+                }
+                if (retainDecodedFrames) decodedFrames += reconstruction[1]
+                if (decodedConsumer != null) {
+                    val consumerStarted = SystemClock.elapsedRealtimeNanos()
+                    decodedConsumer(index, reconstruction[1])
+                    if (collectTimings) excludedNs += elapsedNs(consumerStarted)
+                }
             }
         }
-
-        encoderReconstructions.zip(decodedFrames).forEachIndexed { index, pair ->
-            require(pair.first.contentEquals(pair.second)) {
-                "encoder/decoder reconstruction mismatch at frame=$index"
-            }
-        }
-        if (collectTimings) timings["total"] = elapsedNs(totalStarted)
+        if (collectTimings) timings["total"] = elapsedNs(totalStarted) - excludedNs
         return RunResult(stream, decodedFrames, timings, iBoundaries)
     }
 
-    private fun prepare(): PreparedRuntimes {
-        prepared?.let { return it }
+    private fun prepare(qp: Int): PreparedRuntimes {
+        require(qp in LargeDynamicQuantScales.REQUIRED_QPS) {
+            "Large online QP must be one of ${LargeDynamicQuantScales.REQUIRED_QPS.sorted()}"
+        }
+        prepared?.let {
+            it.selectQp(qp)
+            return it
+        }
         val root = findPackageRoot()
         val manifest = JSONObject(root.resolve("manifest.json").readText())
+        val quantScales = LargeDynamicQuantScales.load(root, manifest)
+        val packagedQp = manifest.optInt("default_qp", manifest.getInt("qp"))
+        if (quantScales == null) {
+            require(qp == packagedQp) {
+                "fixed Large package supports only QP=$packagedQp; install a dynamic-QP package"
+            }
+        } else {
+            require(qp in quantScales.supportedQps) {
+                "dynamic Large package does not support QP=$qp"
+            }
+        }
         val resolution = manifest.getJSONObject("resolution")
         val stream = StreamSpec(
             path = "",
             height = resolution.getInt("height"),
             width = resolution.getInt("width"),
-            qp = manifest.getInt("qp"),
+            qp = qp,
             ecPart = 0,
             useAdaI = 0,
         )
-        require(stream.height == HEIGHT && stream.width == WIDTH && stream.qp == 0) {
-            "Large online main requires ${HEIGHT}x$WIDTH QP=0"
+        require(stream.height == HEIGHT && stream.width == WIDTH) {
+            "Large online main requires ${HEIGHT}x$WIDTH"
         }
         val createStarted = SystemClock.elapsedRealtimeNanos()
         val official = linkedMapOf<String, OfficialNeuronRuntime>()
@@ -242,11 +507,14 @@ class LargeOnlineCodecRunner(
                 pEntropyEncoder = pEncode,
                 iEntropyDecoder = iDecode,
                 pEntropyDecoder = pDecode,
+                quantScales = quantScales,
+                fixedPackageQp = if (quantScales == null) packagedQp else null,
             ).also {
                 prepared = it
                 emit(
                     "large_online_main_prepare models=10 create_ms=${format(elapsedMs(createStarted))} " +
                         "backend=official_aar_neuron fast_models=10 decoder_models=scaled_variance_fp16 " +
+                        "dynamic_qp=${quantScales != null} qp=$qp " +
                         "preference=FAST_SINGLE_ANSWER root=${root.absolutePath}",
                 )
             }
@@ -288,7 +556,7 @@ class LargeOnlineCodecRunner(
         } ?: error("no complete Large online package found")
     }
 
-    private fun emitSummary(results: List<RunResult>) {
+    private fun emitSummary(results: List<RunResult>, frameCount: Int) {
         val labels = results.flatMap { it.timings.keys }.distinct()
         labels.forEach { label ->
             val values = results.mapNotNull { it.timings[label] }
@@ -301,17 +569,35 @@ class LargeOnlineCodecRunner(
                 )
             }
         }
+        val totalValues = results.mapNotNull { it.timings["total"] }
+        if (totalValues.isNotEmpty()) {
+            val meanFrameNs = totalValues.average() / frameCount
+            emit(
+                "large_online_video_summary frames=$frameCount i_frames=1 p_frames=${frameCount - 1} " +
+                    "mean_sequence_ms=${format(totalValues.average() / 1_000_000.0)} " +
+                    "mean_frame_ms=${format(meanFrameNs / 1_000_000.0)} " +
+                    "fps=${format(1_000_000_000.0 / meanFrameNs)} includes_create=false",
+            )
+        }
     }
 
-    private fun calculatePsnr(input: TensorValue, reconstruction: TensorValue): Double {
+    private fun calculatePsnr(input: ByteArray, reconstruction: ByteArray): Double {
+        require(input.size == reconstruction.size && input.size % 4 == 0) { "PSNR tensor byte count mismatch" }
+        val inputFloats = java.nio.ByteBuffer.wrap(input).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+        val reconstructionFloats = java.nio.ByteBuffer.wrap(reconstruction)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .asFloatBuffer()
         var sumSq = 0.0
-        input.data.indices.forEach { index ->
-            val diff = reconstruction.data[index].displayValue() - input.data[index].displayValue()
+        repeat(input.size / 4) { index ->
+            val diff = reconstructionFloats[index].displayValue() - inputFloats[index].displayValue()
             sumSq += diff * diff
         }
-        val rmse = sqrt(sumSq / input.data.size)
+        val rmse = sqrt(sumSq / (input.size / 4))
         return if (rmse == 0.0) Double.POSITIVE_INFINITY else 20.0 * log10(1.0 / rmse)
     }
+
+    private fun shouldResetReference(frameIndex: Int): Boolean =
+        frameIndex > 0 && frameIndex % REFERENCE_RESET_INTERVAL == 1
 
     private fun writeTensorPng(tensor: TensorValue, fileName: String): File {
         val plane = HEIGHT * WIDTH
@@ -368,8 +654,14 @@ class LargeOnlineCodecRunner(
         val iBoundaries: Map<String, ByteArray>,
     )
 
+    private data class SequenceRunResult(
+        val run: RunResult,
+        val psnrs: List<Double>,
+        val lastDecoded: ByteArray,
+    )
+
     private data class PreparedRuntimes(
-        val stream: StreamSpec,
+        var stream: StreamSpec,
         val temporalFromFrame: OfficialNeuronRuntime,
         val temporalFromFeature: OfficialNeuronRuntime,
         val iEncoder: OfficialNeuronRuntime,
@@ -380,7 +672,32 @@ class LargeOnlineCodecRunner(
         val pEntropyEncoder: PEntropyRansMergedRuntime,
         val iEntropyDecoder: IEntropyRansDecodeMergedRuntime,
         val pEntropyDecoder: PEntropyRansDecodeMergedRuntime,
+        val quantScales: LargeDynamicQuantScales?,
+        val fixedPackageQp: Int?,
     ) : AutoCloseable {
+        private var selectedQuantInputs = quantScales?.select(stream.qp)
+
+        fun selectQp(qp: Int) {
+            if (fixedPackageQp != null) {
+                require(qp == fixedPackageQp) {
+                    "fixed Large package supports only QP=$fixedPackageQp; install a dynamic-QP package"
+                }
+            } else {
+                require(qp in (quantScales?.supportedQps ?: emptySet())) {
+                    "dynamic Large package does not support QP=$qp"
+                }
+            }
+            if (stream.qp != qp) {
+                stream = stream.copy(qp = qp)
+                selectedQuantInputs = quantScales?.select(qp)
+            }
+        }
+
+        fun neuralInputs(inputs: List<ByteArray>, vararg scaleNames: String): List<ByteArray> {
+            val scales = selectedQuantInputs ?: return inputs
+            return inputs + scaleNames.map { name -> scales[name] ?: error("missing selected scale $name") }
+        }
+
         override fun close() {
             temporalFromFrame.close()
             temporalFromFeature.close()
@@ -398,7 +715,9 @@ class LargeOnlineCodecRunner(
     private companion object {
         const val HEIGHT = 256
         const val WIDTH = 512
-        const val FRAME_COUNT = 3
+        const val DEFAULT_FRAME_COUNT = 3
+        const val REFERENCE_RESET_INTERVAL = 32
+        const val P_ENTROPY_LOG_INTERVAL = 16
         const val I_ENTROPY_ENCODER = "i_entropy_prior_merged_rans.tflite"
         const val P_ENTROPY_ENCODER = "p_entropy_prior_merged_rans.tflite"
         const val I_ENTROPY_DECODER = "i_entropy_decode_merged_rans.tflite"

@@ -41,12 +41,15 @@ object ImageTensorLoader {
                 data[2 * plane + offset] = Color.blue(pixel).toModelInput()
             }
         }
+        val originalWidth = bitmap.width
+        val originalHeight = bitmap.height
         if (scaled !== bitmap) scaled.recycle()
+        bitmap.recycle()
         return ImageTensorInput(
             TensorValue("input_image", longArrayOf(1, 3, HEIGHT.toLong(), WIDTH.toLong()), data),
             source,
-            bitmap.width,
-            bitmap.height,
+            originalWidth,
+            originalHeight,
         )
     }
 

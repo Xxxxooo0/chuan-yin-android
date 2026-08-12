@@ -181,13 +181,18 @@ class FixedGenerator(nn.Module):
         self.head = source.head
         self.register_buffer("q_recon", model.q_scale_recon[qp : qp + 1].detach().clone())
 
-    def forward(self, codeword: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        codeword: torch.Tensor,
+        q_recon: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        quant_step = self.q_recon if q_recon is None else q_recon
         value = self.conv_in(codeword)
         value = self.stage1(self.ada1(value, codeword))
         value = self.stage2(self.ada2(value, codeword))
         value = self.upsample(self.ada3(value, codeword))
         value = self.stage3(value)
-        value = self.stage4(self.ada4(value, codeword), self.q_recon)
+        value = self.stage4(self.ada4(value, codeword), quant_step)
         value = self.head(self.ada_final(value, codeword))
         return torch.clamp(F.pixel_shuffle(value, 8), -1.0, 1.0)
 
@@ -233,8 +238,13 @@ class FixedIFeatureDec(nn.Module):
         self.conv_out = ExplicitDepthConvBlock(source.conv_out)
         self.register_buffer("q_dec", model.q_scale_dec[qp : qp + 1].detach().clone())
 
-    def forward(self, y_hat: torch.Tensor) -> torch.Tensor:
-        value = self.conv_in(y_hat) * self.q_dec
+    def forward(
+        self,
+        y_hat: torch.Tensor,
+        q_dec: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        quant_step = self.q_dec if q_dec is None else q_dec
+        value = self.conv_in(y_hat) * quant_step
         for module in self.body:
             value = module(value)
         value = standard_silu_no_fusion(value)
@@ -343,12 +353,18 @@ class FixedPFeatureDec(nn.Module):
         self.conv2 = source.conv2
         self.register_buffer("q_dec", model.q_scale_dec[qp : qp + 1].detach().clone())
 
-    def forward(self, y_hat: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        y_hat: torch.Tensor,
+        ctx: torch.Tensor,
+        q_dec: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        quant_step = self.q_dec if q_dec is None else q_dec
         value = self.up(y_hat)
         value = torch.cat((value, ctx), dim=1)
         for block in self.conv1:
             value = block(value)
-        return self.conv2(value) * self.q_dec
+        return self.conv2(value) * quant_step
 
 
 class PFeatureDecNhwc(nn.Module):

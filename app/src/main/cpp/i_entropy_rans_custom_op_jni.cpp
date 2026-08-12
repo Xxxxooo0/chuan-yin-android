@@ -114,11 +114,14 @@ struct Runtime {
     TfLiteInterpreterOptions* options = nullptr;
     TfLiteRegistrationExternal* registration = nullptr;
     TfLiteInterpreter* interpreter = nullptr;
+    std::unique_ptr<RansCustomState> ransState;
+    int currentQp = 0;
 };
 
 TfliteApi* gApi = nullptr;
-std::unique_ptr<RansCustomState> gRansState;
+Runtime* gActiveRuntime = nullptr;
 std::mutex gRansMutex;
+std::mutex gInvokeMutex;
 
 template <typename T>
 T loadSymbol(void* library, const char* name) {
@@ -263,6 +266,10 @@ std::shared_ptr<std::vector<int16_t>> packYFromNhwc(const float* symbols, const 
 TfLiteStatus ransInvoke(TfLiteOpaqueContext* context, TfLiteOpaqueNode* node) {
     std::lock_guard<std::mutex> lock(gRansMutex);
     try {
+        Runtime* runtime = gActiveRuntime;
+        if (runtime == nullptr || gApi != &runtime->api) {
+            throw std::runtime_error("rANS custom op has no active runtime");
+        }
         const int inputCount = gApi == nullptr ? 0 : gApi->opaqueInputCount(node);
         if ((inputCount != 13 && inputCount != 17) || gApi->opaqueOutputCount(node) != 2) {
             throw std::runtime_error("rANS custom op input/output count mismatch");
@@ -275,16 +282,16 @@ TfLiteStatus ransInvoke(TfLiteOpaqueContext* context, TfLiteOpaqueNode* node) {
         for (int index = 0; index < inputCount; ++index) {
             inputs.push_back(customInput(context, node, index));
         }
-        if (!gRansState) {
+        if (!runtime->ransState) {
             const CdfData gaussian = copyCdf(
                 inputs[constantsStart], inputs[constantsStart + 1], inputs[constantsStart + 2]);
             const CdfData z = copyCdf(
                 inputs[constantsStart + 3], inputs[constantsStart + 4], inputs[constantsStart + 5]);
-            gRansState = std::make_unique<RansCustomState>();
-            gRansState->encoder = std::make_unique<CustomRansEncoder>(gaussian, z);
-            gRansState->zStartOffset = tensorData<int32_t>(inputs[constantsStart + 6])[0];
-            gRansState->zPerChannelSize = tensorData<int32_t>(inputs[constantsStart + 7])[0];
-            if (gRansState->zPerChannelSize <= 0) {
+            runtime->ransState = std::make_unique<RansCustomState>();
+            runtime->ransState->encoder = std::make_unique<CustomRansEncoder>(gaussian, z);
+            runtime->ransState->zStartOffset = tensorData<int32_t>(inputs[constantsStart + 6])[0];
+            runtime->ransState->zPerChannelSize = tensorData<int32_t>(inputs[constantsStart + 7])[0];
+            if (runtime->ransState->zPerChannelSize <= 0) {
                 throw std::runtime_error("invalid embedded z per-channel size");
             }
         }
@@ -296,8 +303,8 @@ TfLiteStatus ransInvoke(TfLiteOpaqueContext* context, TfLiteOpaqueNode* node) {
                 tensorData<float>(inputs[1 + stage]),
                 tensorData<float>(inputs[scalesStart + stage])));
         }
-        const std::vector<uint8_t> payload = gRansState->encoder->encode(
-            z, gRansState->zStartOffset, gRansState->zPerChannelSize, yStages);
+        const std::vector<uint8_t> payload = runtime->ransState->encoder->encode(
+            z, runtime->currentQp * 128, runtime->ransState->zPerChannelSize, yStages);
         TfLiteOpaqueTensor* payloadOutput = gApi->opaqueOutput(context, node, 0);
         TfLiteOpaqueTensor* sizeOutput = gApi->opaqueOutput(context, node, 1);
         if (payloadOutput == nullptr || sizeOutput == nullptr ||
@@ -323,11 +330,6 @@ void destroyRuntime(Runtime* runtime) {
     if (runtime->registration != nullptr) runtime->api.registrationDelete(runtime->registration);
     if (runtime->options != nullptr) runtime->api.optionsDelete(runtime->options);
     if (runtime->model != nullptr) runtime->api.modelDelete(runtime->model);
-    {
-        std::lock_guard<std::mutex> lock(gRansMutex);
-        gRansState.reset();
-        gApi = nullptr;
-    }
     if (runtime->api.library != nullptr) dlclose(runtime->api.library);
     delete runtime;
 }
@@ -341,7 +343,6 @@ Runtime* createRuntime(
     if (delegate == nullptr) throw std::runtime_error("Neuron delegate handle is null");
     auto runtime = std::make_unique<Runtime>();
     runtime->api = loadApi();
-    gApi = &runtime->api;
     try {
         runtime->model = runtime->api.modelCreateFromFile(modelPath.c_str());
         if (runtime->model == nullptr) throw std::runtime_error("TfLiteModelCreateFromFile failed");
@@ -366,6 +367,16 @@ Runtime* createRuntime(
         destroyRuntime(runtime.release());
         throw;
     }
+}
+
+TfLiteStatus invokeRuntime(Runtime* runtime) {
+    std::lock_guard<std::mutex> lock(gInvokeMutex);
+    gActiveRuntime = runtime;
+    gApi = &runtime->api;
+    const TfLiteStatus status = runtime->api.invoke(runtime->interpreter);
+    gApi = nullptr;
+    gActiveRuntime = nullptr;
+    return status;
 }
 
 void copyJavaInput(JNIEnv* env, Runtime* runtime, int index, jbyteArray input) {
@@ -465,12 +476,14 @@ Java_com_gvcrt_clean_IEntropyRansMergedRuntime_nativeCreate(
 
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_com_gvcrt_clean_IEntropyRansMergedRuntime_nativeRun(
-    JNIEnv* env, jclass, jlong handle, jbyteArray input, jint outputMode) {
+    JNIEnv* env, jclass, jlong handle, jbyteArray input, jint qp, jint outputMode) {
     try {
         auto* runtime = reinterpret_cast<Runtime*>(handle);
         if (runtime == nullptr) throw std::runtime_error("merged rANS runtime is closed");
+        if (qp < 0 || qp > 9) throw std::runtime_error("I QP must be in [0,9]");
+        runtime->currentQp = qp;
         copyJavaInput(env, runtime, 0, input);
-        if (runtime->api.invoke(runtime->interpreter) != kTfLiteOk) {
+        if (invokeRuntime(runtime) != kTfLiteOk) {
             throw std::runtime_error("merged rANS invoke failed");
         }
         return collectOutputs(env, runtime, outputMode);
@@ -512,13 +525,16 @@ Java_com_gvcrt_clean_PEntropyRansMergedRuntime_nativeRun(
     jlong handle,
     jbyteArray y,
     jbyteArray ctxT,
+    jint qp,
     jint outputMode) {
     try {
         auto* runtime = reinterpret_cast<Runtime*>(handle);
         if (runtime == nullptr) throw std::runtime_error("P merged rANS runtime is closed");
+        if (qp < 0 || qp > 9) throw std::runtime_error("P QP must be in [0,9]");
+        runtime->currentQp = qp;
         copyJavaInput(env, runtime, 0, y);
         copyJavaInput(env, runtime, 1, ctxT);
-        if (runtime->api.invoke(runtime->interpreter) != kTfLiteOk) {
+        if (invokeRuntime(runtime) != kTfLiteOk) {
             throw std::runtime_error("P merged rANS invoke failed");
         }
         return collectOutputs(env, runtime, outputMode);

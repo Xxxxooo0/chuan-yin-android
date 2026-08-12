@@ -7,10 +7,13 @@ import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import java.io.File
 import java.util.Locale
@@ -28,6 +31,7 @@ class MainActivity : Activity() {
     private var imageRunner: ImageInferenceRunner? = null
     private var imageRunnerBackend: OnnxBackend? = null
     private var largeOnlineRunner: LargeOnlineCodecRunner? = null
+    private var selectedLargeQp = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -132,6 +136,27 @@ class MainActivity : Activity() {
             addView(largeIDecodeButton, buttonLayoutParams())
             addView(largeMainButton, buttonLayoutParams())
         }
+        val largeQpSelector = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf("QP 0", "QP 3", "QP 6", "QP 9"),
+            )
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    selectedLargeQp = LARGE_QPS[position]
+                }
+
+                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+            }
+        }
+        val largeQpControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(16, 0, 16, 0)
+            addView(TextView(this@MainActivity).apply { text = "Large QP" })
+            addView(largeQpSelector)
+        }
         inputImage = comparisonImageView()
         reconImage = comparisonImageView()
         reconTitle = comparisonTitle("Reconstruction")
@@ -154,6 +179,7 @@ class MainActivity : Activity() {
             addView(speedControls)
             addView(projectControls)
             if (!isOnnxDemo) {
+                addView(largeQpControls)
                 addView(largeControls)
             }
             addView(
@@ -226,6 +252,7 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("largePEntropyDecodeSpeedTest", false) ->
                 listOf("large_p_entropy_decode_speed")
             intent.getBooleanExtra("largePEntropyDecodeTest", false) -> listOf("large_p_entropy_decode")
+            intent.getBooleanExtra("largeOnlineVideoTest", false) -> listOf("large_online_video")
             intent.getBooleanExtra("largeOnlineMainTest", false) -> listOf("large_online_main")
             intent.getBooleanExtra("ransCustomOpPartitionTest", false) -> listOf("rans_custom_op_partition")
             intent.getBooleanExtra("enterpriseTfliteTest", false) -> listOf("enterprise_tflite")
@@ -407,6 +434,21 @@ class MainActivity : Activity() {
                                 imagePath = intent.getStringExtra("imagePath"),
                                 warmupRuns = intent.getIntExtra("largeOnlineWarmup", 1),
                                 measuredRuns = intent.getIntExtra("largeOnlineMeasured", 1),
+                                qp = intent.getIntExtra("largeOnlineQp", selectedLargeQp),
+                            )
+                        }
+                        moduleName == "large_online_video" -> {
+                            largeOnlineRunner(::emit).runSequence(
+                                sequenceDir = intent.getStringExtra("sequenceDir")
+                                    ?: error("largeOnlineVideoTest requires sequenceDir"),
+                                frameCount = intent.getIntExtra("sequenceFrames", 24),
+                                warmupRuns = intent.getIntExtra("largeOnlineWarmup", 0),
+                                measuredRuns = intent.getIntExtra("largeOnlineMeasured", 1),
+                                dumpPEntropyBoundaries = intent.getBooleanExtra(
+                                    "largeOnlineEntropyDiagnostics",
+                                    false,
+                                ),
+                                qp = intent.getIntExtra("largeOnlineQp", selectedLargeQp),
                             )
                         }
                         moduleName == "rans_custom_op_partition" -> {
@@ -563,6 +605,7 @@ class MainActivity : Activity() {
 
     companion object {
         const val TAG = "GVC_RT_CLEAN"
+        private val LARGE_QPS = intArrayOf(0, 3, 6, 9)
         private val ONNX_DEMO_MODULES = setOf(
             "temporal_reference",
             "complete_encoder",

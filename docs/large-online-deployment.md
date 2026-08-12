@@ -10,7 +10,15 @@ rANS 通过图内原生 CPU custom op 执行，连续神经网络交给 NeuronDe
 
 旧的 I 7 张分图和 P 4 张分图不再用于正式 Android 路径。
 
+正式模型包采用运行时动态 QP：QP 0、3、6、9 共用同一套 10 张 TFLite。六张连续
+神经网络图从 `quant_scales/` 接收当前 QP 的 `q_feature/q_enc/q_dec/q_recon`，四张
+entropy+rANS 图由 JNI 接收当前 QP 并选择对应 Z CDF 区间。QP0 仅作为默认回归配置。
+
 ## 服务器导出与打包
+
+动态 QP 连续图使用 `export_large_dynamic_qp_nhwc.py` 从同一 I/P checkpoint 导出，并在
+服务器对 QP 0、3、6、9 分别与固定 QP 源路径比较。通过后使用
+`package_large_dynamic_qp.py` 与四张 merged+rANS 图组成单一模型包。
 
 ```bash
 cd /media/ltelab/D/weilingfeng/GVC-RT_clean_android
@@ -103,6 +111,7 @@ $root = '/sdcard/Android/data/com.gvcrt.clean.mtkoffline/files/enterprise_tflite
 & $adb shell am start -n com.gvcrt.clean.mtkoffline/com.gvcrt.clean.MainActivity `
   --ez largeOnlineMainTest true `
   --es imagePath asset:sample/park_scene_im00001.png `
+  --ei largeOnlineQp 6 `
   --ei largeOnlineWarmup 1 `
   --ei largeOnlineMeasured 1
 

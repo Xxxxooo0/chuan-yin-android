@@ -10,16 +10,16 @@ class IEntropyRansDecodeMergedRuntime private constructor(
     val optionsSummary: String,
 ) : AutoCloseable {
     @Synchronized
-    fun run(payload: ByteArray, copyOutputs: Boolean = true): List<ByteArray> {
+    fun run(payload: ByteArray, copyOutputs: Boolean = true, qp: Int = 0): List<ByteArray> {
         check(nativeHandle != 0L) { "merged entropy decoder is closed" }
-        return nativeRun(nativeHandle, payload, if (copyOutputs) OUTPUT_ALL else OUTPUT_NONE).toList()
+        return nativeRun(nativeHandle, payload, qp, if (copyOutputs) OUTPUT_ALL else OUTPUT_NONE).toList()
     }
 
     /** Returns only i_y_hat while still executing the full serial entropy decode. */
     @Synchronized
-    fun runCanonical(payload: ByteArray): ByteArray {
+    fun runCanonical(payload: ByteArray, qp: Int = 0): ByteArray {
         check(nativeHandle != 0L) { "merged entropy decoder is closed" }
-        return nativeRun(nativeHandle, payload, OUTPUT_CANONICAL).single()
+        return nativeRun(nativeHandle, payload, qp, OUTPUT_CANONICAL).single()
     }
 
     override fun close() {
@@ -67,7 +67,7 @@ class IEntropyRansDecodeMergedRuntime private constructor(
         private external fun nativeCreate(modelPath: String, delegateHandle: Long): Long
 
         @JvmStatic
-        private external fun nativeRun(handle: Long, payload: ByteArray, outputMode: Int): Array<ByteArray>
+        private external fun nativeRun(handle: Long, payload: ByteArray, qp: Int, outputMode: Int): Array<ByteArray>
 
         @JvmStatic
         private external fun nativeClose(handle: Long)

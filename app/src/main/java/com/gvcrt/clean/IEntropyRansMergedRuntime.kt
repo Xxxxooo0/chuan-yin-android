@@ -10,16 +10,16 @@ class IEntropyRansMergedRuntime private constructor(
     val optionsSummary: String,
 ) : AutoCloseable {
     @Synchronized
-    fun run(input: ByteArray, copyOutputs: Boolean = true): List<ByteArray> {
+    fun run(input: ByteArray, copyOutputs: Boolean = true, qp: Int = 0): List<ByteArray> {
         check(nativeHandle != 0L) { "merged rANS runtime is closed" }
-        return nativeRun(nativeHandle, input, if (copyOutputs) OUTPUT_ALL else OUTPUT_NONE).toList()
+        return nativeRun(nativeHandle, input, qp, if (copyOutputs) OUTPUT_ALL else OUTPUT_NONE).toList()
     }
 
     /** Returns only i_y_hat and the trimmed rANS payload for the canonical codec path. */
     @Synchronized
-    fun runCanonical(input: ByteArray, copyOutputs: Boolean = true): List<ByteArray> {
+    fun runCanonical(input: ByteArray, copyOutputs: Boolean = true, qp: Int = 0): List<ByteArray> {
         check(nativeHandle != 0L) { "merged rANS runtime is closed" }
-        return nativeRun(nativeHandle, input, if (copyOutputs) OUTPUT_CANONICAL else OUTPUT_NONE).toList()
+        return nativeRun(nativeHandle, input, qp, if (copyOutputs) OUTPUT_CANONICAL else OUTPUT_NONE).toList()
     }
 
     override fun close() {
@@ -66,7 +66,7 @@ class IEntropyRansMergedRuntime private constructor(
         private external fun nativeCreate(modelPath: String, delegateHandle: Long): Long
 
         @JvmStatic
-        private external fun nativeRun(handle: Long, input: ByteArray, outputMode: Int): Array<ByteArray>
+        private external fun nativeRun(handle: Long, input: ByteArray, qp: Int, outputMode: Int): Array<ByteArray>
 
         @JvmStatic
         private external fun nativeClose(handle: Long)
