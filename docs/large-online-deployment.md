@@ -10,19 +10,61 @@ rANS 通过图内原生 CPU custom op 执行，连续神经网络交给 NeuronDe
 
 旧的 I 7 张分图和 P 4 张分图不再用于正式 Android 路径。
 
-正式模型包采用运行时动态 QP：QP 0、3、6、9 共用同一套 10 张 TFLite。六张连续
-神经网络图从 `quant_scales/` 接收当前 QP 的 `q_feature/q_enc/q_dec/q_recon`，四张
-entropy+rANS 图由 JNI 接收当前 QP 并选择对应 Z CDF 区间。QP0 仅作为默认回归配置。
+正式模型包固定为 QP9。六张连续神经网络图将 QP9 的
+`q_feature/q_enc/q_dec/q_recon` 固化为图内常量，四张 entropy+rANS 图由 JNI 固定接收
+QP9。动态 QP 0/3/6/9 包仅保留作回退和对照，不再作为主线部署包。
 
 ## 服务器导出与打包
 
-动态 QP 连续图使用 `export_large_dynamic_qp_nhwc.py` 从同一 I/P checkpoint 导出，并在
-服务器对 QP 0、3、6、9 分别与固定 QP 源路径比较。通过后使用
-`package_large_dynamic_qp.py` 与四张 merged+rANS 图组成单一模型包。
+固定 QP9 连续图分别使用 `export_three_modules_offline_nhwc.py` 和
+`export_decoder_full_norm_rewrite_nhwc.py` 从同一 I/P checkpoint 导出。通过服务器转换和
+解码精度检查后，使用 `package_large_fixed_qp.py` 与四张 merged+rANS 图组成模型包。
 
 ```bash
 cd /media/ltelab/D/weilingfeng/GVC-RT_clean_android
 export GVC_RT_SOURCE_ROOT=/media/ltelab/D/weilingfeng/GVC-RT_inference
+export PY=/media/ltelab/D/weilingfeng/conda_envs/weilingfeng/bin/python
+export NCC=$PWD/neuropilot-sdk-premium-8.0.11-build20260211
+
+$PY -u server_tools/export_three_modules_offline_nhwc.py \
+  --source-root "$GVC_RT_SOURCE_ROOT" \
+  --android-root "$PWD" \
+  --output-dir outputs/large_fixed_qp9_front \
+  --ncc-tflite "$NCC" \
+  --qp 9 \
+  --candidates temporal_from_frame_big,temporal_from_feature_big,i_encoder_analysis_big,p_encoder_analysis_big
+
+$PY -u server_tools/export_decoder_full_norm_rewrite_nhwc.py \
+  --source-root "$GVC_RT_SOURCE_ROOT" \
+  --android-root "$PWD" \
+  --output-dir outputs/large_fixed_qp9_decoder \
+  --ncc-tflite "$NCC" \
+  --qp 9 \
+  --targets i,p
+
+mkdir -p outputs/large_fixed_qp9_entropy_models
+cp outputs/i_entropy_merged_rans/i_entropy_prior_merged_rans.tflite \
+  outputs/large_fixed_qp9_entropy_models/
+cp outputs/p_entropy_merged_rans/p_entropy_prior_merged_rans.tflite \
+  outputs/large_fixed_qp9_entropy_models/
+cp outputs/i_entropy_decoder_merged_rans/i_entropy_decode_merged_rans.tflite \
+  outputs/large_fixed_qp9_entropy_models/
+cp outputs/p_entropy_decoder_merged_rans/p_entropy_decode_merged_rans.tflite \
+  outputs/large_fixed_qp9_entropy_models/
+
+$PY -u server_tools/package_large_fixed_qp.py \
+  --front-export-dir outputs/large_fixed_qp9_front \
+  --decoder-export-dir outputs/large_fixed_qp9_decoder \
+  --entropy-model-dir outputs/large_fixed_qp9_entropy_models \
+  --output-dir outputs/gvc-rt-large_tflite_online_fixed_qp9_270p
+
+tar -czf outputs/gvc-rt-large_tflite_online_fixed_qp9_270p.tar.gz \
+  -C outputs gvc-rt-large_tflite_online_fixed_qp9_270p
+```
+
+下面的命令仅用于重新生成四张 entropy+rANS 公共图；已有经过验证的公共图时无需重复执行。
+
+```bash
 
 python -u server_tools/export_i_entropy_merged_nhwc.py \
   --source-root "$GVC_RT_SOURCE_ROOT" \
@@ -111,7 +153,7 @@ $root = '/sdcard/Android/data/com.gvcrt.clean.mtkoffline/files/enterprise_tflite
 & $adb shell am start -n com.gvcrt.clean.mtkoffline/com.gvcrt.clean.MainActivity `
   --ez largeOnlineMainTest true `
   --es imagePath asset:sample/park_scene_im00001.png `
-  --ei largeOnlineQp 6 `
+  --ei largeOnlineQp 9 `
   --ei largeOnlineWarmup 1 `
   --ei largeOnlineMeasured 1
 
@@ -226,3 +268,8 @@ NAL，解码端只读取封装后的 payload，并维护独立的 Reference Fram
 均值为 `394.009 ms`。10 张模型全部调用，`status=PASS all_models_exercised=true`；首次在线创建
 约 `110.3 s`，不计入稳态耗时。输出码流为
 `enterprise_tflite_codec/large/main/encoded_i_p_p.gvc`，同时保存三帧解码 tensor 和最终重建图。
+
+固定 QP9 包在 Infinix X6891 上使用 ParkScene 前 24 帧、warmup 1、正式 1 次测试：
+`123.988 ms/帧`、`8.065 fps`，平均/最低/末帧 PSNR 分别为
+`23.022/22.537/23.241 dB`，完整 I/P 编码、封装和独立解码通过。首次在线创建约
+`108.9 s`，不计入稳态速度。同条件动态 QP9 包为 `135.759 ms/帧、7.366 fps`。

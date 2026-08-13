@@ -21,7 +21,7 @@ class LargeOnlineCodecRunner(
 ) : AutoCloseable {
     private var prepared: PreparedRuntimes? = null
 
-    fun run(imagePath: String?, warmupRuns: Int = 1, measuredRuns: Int = 1, qp: Int = 0) {
+    fun run(imagePath: String?, warmupRuns: Int = 1, measuredRuns: Int = 1, qp: Int = DEFAULT_QP) {
         val image = ImageTensorLoader.load(context, imagePath)
         val displayInput = image.tensor.renamed("input_frame")
         runFrames(
@@ -40,7 +40,7 @@ class LargeOnlineCodecRunner(
         warmupRuns: Int = 0,
         measuredRuns: Int = 1,
         dumpPEntropyBoundaries: Boolean = false,
-        qp: Int = 0,
+        qp: Int = DEFAULT_QP,
     ) {
         require(frameCount > 0) { "Large online video frame count must be positive" }
         val directory = File(sequenceDir)
@@ -715,6 +715,7 @@ class LargeOnlineCodecRunner(
     private companion object {
         const val HEIGHT = 256
         const val WIDTH = 512
+        const val DEFAULT_QP = 9
         const val DEFAULT_FRAME_COUNT = 3
         const val REFERENCE_RESET_INTERVAL = 32
         const val P_ENTROPY_LOG_INTERVAL = 16

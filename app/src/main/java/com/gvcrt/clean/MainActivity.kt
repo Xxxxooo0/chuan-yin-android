@@ -7,7 +7,6 @@ import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
 import android.view.View
-import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.ImageView
@@ -31,7 +30,6 @@ class MainActivity : Activity() {
     private var imageRunner: ImageInferenceRunner? = null
     private var imageRunnerBackend: OnnxBackend? = null
     private var largeOnlineRunner: LargeOnlineCodecRunner? = null
-    private var selectedLargeQp = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -140,15 +138,9 @@ class MainActivity : Activity() {
             adapter = ArrayAdapter(
                 this@MainActivity,
                 android.R.layout.simple_spinner_dropdown_item,
-                listOf("QP 0", "QP 3", "QP 6", "QP 9"),
+                listOf("QP 9 (fixed)"),
             )
-            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                    selectedLargeQp = LARGE_QPS[position]
-                }
-
-                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-            }
+            isEnabled = false
         }
         val largeQpControls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -434,7 +426,7 @@ class MainActivity : Activity() {
                                 imagePath = intent.getStringExtra("imagePath"),
                                 warmupRuns = intent.getIntExtra("largeOnlineWarmup", 1),
                                 measuredRuns = intent.getIntExtra("largeOnlineMeasured", 1),
-                                qp = intent.getIntExtra("largeOnlineQp", selectedLargeQp),
+                                qp = fixedLargeQp(),
                             )
                         }
                         moduleName == "large_online_video" -> {
@@ -448,7 +440,7 @@ class MainActivity : Activity() {
                                     "largeOnlineEntropyDiagnostics",
                                     false,
                                 ),
-                                qp = intent.getIntExtra("largeOnlineQp", selectedLargeQp),
+                                qp = fixedLargeQp(),
                             )
                         }
                         moduleName == "rans_custom_op_partition" -> {
@@ -585,6 +577,14 @@ class MainActivity : Activity() {
             largeOnlineRunner = it
         }
 
+    private fun fixedLargeQp(): Int {
+        val requested = intent.getIntExtra("largeOnlineQp", FIXED_LARGE_QP)
+        require(requested == FIXED_LARGE_QP) {
+            "GVC-RT Large mainline is fixed to QP=$FIXED_LARGE_QP; requested QP=$requested"
+        }
+        return FIXED_LARGE_QP
+    }
+
     private fun isMemoryDiagnosticLine(line: String): Boolean =
         line.startsWith("memory_") ||
             line.startsWith("image_memory_") ||
@@ -605,7 +605,7 @@ class MainActivity : Activity() {
 
     companion object {
         const val TAG = "GVC_RT_CLEAN"
-        private val LARGE_QPS = intArrayOf(0, 3, 6, 9)
+        private const val FIXED_LARGE_QP = 9
         private val ONNX_DEMO_MODULES = setOf(
             "temporal_reference",
             "complete_encoder",
