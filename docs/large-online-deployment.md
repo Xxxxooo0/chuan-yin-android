@@ -12,7 +12,7 @@ rANS 通过图内原生 CPU custom op 执行，连续神经网络交给 NeuronDe
 
 正式模型包固定为 QP9。六张连续神经网络图将 QP9 的
 `q_feature/q_enc/q_dec/q_recon` 固化为图内常量，四张 entropy+rANS 图由 JNI 固定接收
-QP9。动态 QP 0/3/6/9 包仅保留作回退和对照，不再作为主线部署包。
+QP9。旧动态 QP 和固定 QP0 在线包已从本地模型分支删除。
 
 ## 服务器导出与打包
 

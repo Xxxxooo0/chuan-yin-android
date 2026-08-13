@@ -30,7 +30,7 @@ Gradle 将该资产目录作为 `onnxDemo` flavor 的额外 assets source。使�
 - 独立 I 熵模型：`models/large/local_models/gvc-rt-large/online_entropy/i_entropy_prior_merged.tflite`
 
 固定 QP9 包包含六张连续神经网络图及 I/P 编解码四张 entropy+rANS 图，不需要
-`quant_scales/`。动态 QP 包保留作回退；旧的 7 张 I 与 4 张 P entropy/prior 分图不再使用。
+`quant_scales/`。旧在线包及旧的 7 张 I 与 4 张 P entropy/prior 分图不再使用。
 
 ## GVC-RT Small
 
