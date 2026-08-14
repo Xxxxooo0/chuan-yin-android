@@ -13,3 +13,7 @@
 - `gvc-rt-large_precision_270p_qp0.tar.gz`：服务器精度参考张量与对比脚本。
 
 当前主线固定输入尺寸为 `256x512`（270p 填充后的工作尺寸）和 QP9，Tensor 布局为 NHWC、数据类型为 FP32。
+
+完整性校验见本目录 `SHA256SUMS.txt`（覆盖全部包、`online_entropy/` 文件与本 README）；交付或部署前按清单核对。
+
+正式包替换必须先在主项目 `model_test/<test-id>/` 按 `AGENTS.md` 流程完成精度与速度验证，通过后才允许替换；替换时同步更新本 README 与 `SHA256SUMS.txt`，随后删除整个测试目录。
