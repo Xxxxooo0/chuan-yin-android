@@ -27,7 +27,7 @@ Gradle 将该资产目录作为 `onnxDemo` flavor 的额外 assets source。使�
 - Worktree：`models/large/`
 - 包目录：`models/large/`
 - 当前推荐包：`gvc-rt-large_tflite_online_fixed_qp9_270p.tar.gz`
-- 熵公共图：`models/large/online_entropy/`（四张 merged+rANS 图、诊断基线 `i_entropy_prior_merged.tflite` 与 `manifest.json`）
+- 熵公共图：`models/large/online_entropy/`（四张 merged+rANS 图与 `manifest.json`）
 
 固定 QP9 包包含六张连续神经网络图及 I/P 编解码四张 entropy+rANS 图，不需要
 `quant_scales/`。`online_entropy/` 同时作为公共图备份与诊断基线，其中四张
@@ -39,7 +39,8 @@ merged+rANS 图与固定 QP9 包内容一致。旧在线包及旧的 7 张 I 与
 - 模型分支：`GVC-RT-S-models`
 - Worktree：`models/small/`
 - 包目录：`models/small/`
-- 当前 TFLite 包：`gvc-rt-small_tflite_codec_270p_qp0_with_inputs.tar.gz`
+- 当前企业流程：四模型 QP9（`temporal_from_frame`、`temporal_from_feature`、`encoder`、`decoder`），打包见 `server_tools/compile_tflite_package_to_dla.py` 与 `package_enterprise_video_sequence.py`，二者要求恰好这四张模型且 `fixed_q_index=9`
+- 本地旧包：`gvc-rt-small_tflite_codec_270p_qp0_with_inputs.tar.gz`（三模型 QP0），新四模型包生成并通过 `model_test/` 验证后按晋升流程替换
 
 ## 使用原则
 

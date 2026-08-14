@@ -102,8 +102,8 @@ Android 将生成文件放入 Large 在线包的 `models/` 后，通过
 ## 企业 TFLite 包转 DLA 与视频序列交付
 
 `compile_tflite_package_to_dla.py` 将已验证的企业 TFLite 包整体编译为 NCC 验证的离线 DLA 包
-（`--arch mdlaX.Y`、`--opt-bw`、`--relax-fp32`）。`package_enterprise_video_sequence.py`
-将已验证 DLA 模型与链式视频序列输入（Large 为 `i_encoder/i_decoder + temporal_from_frame + temporal_from_feature + p_encoder/p_decoder`）合并为交付包。
+（`--arch mdlaX.Y`、`--opt-bw`、`--relax-fp32`）；Small 输入包必须恰好包含四张模型且 `fixed_q_index=9`。`package_enterprise_video_sequence.py`
+将已验证 DLA 模型与链式视频序列输入合并为交付包：Small 使用四模型 QP9 流程（`temporal_from_frame`、`temporal_from_feature`、`encoder`、`decoder`），Large 使用六模型流程。
 
 ```bash
 python server_tools/compile_tflite_package_to_dla.py --help

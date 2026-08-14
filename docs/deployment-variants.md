@@ -22,7 +22,7 @@ Large 与 Small 均使用同一 APK；模型包位于独立的本地模型分支
 | 模型变体 | 模型包 | 设备目录 | 测试参数 |
 | --- | --- | --- | --- |
 | Large | `gvc-rt-large_tflite_online_fixed_qp9_270p.tar.gz`（QP9，含 6 张连续图 + 4 张 entropy+rANS 图） | `enterprise_tflite/large/` | `enterpriseTfliteVariant=large` |
-| Small | `gvc-rt-small_tflite_codec_270p_qp0_with_inputs.tar.gz`（QP0，3 张 TFLite + 固定测试输入） | `enterprise_tflite/small/` | `enterpriseTfliteVariant=small` |
+| Small | 四模型 QP9 流程：`temporal_from_frame`、`temporal_from_feature`、`encoder`、`decoder`（打包见 `server_tools/compile_tflite_package_to_dla.py`、`package_enterprise_video_sequence.py`；本地 QP0 三模型包为旧代际） | `enterprise_tflite/small/` | `enterpriseTfliteVariant=small` |
 
 也可使用 `enterpriseTfliteVariant=all` 依次检查两个变体。`mtkOffline` 是历史 source set 名称，不表示当前加载 `.dla`。
 
