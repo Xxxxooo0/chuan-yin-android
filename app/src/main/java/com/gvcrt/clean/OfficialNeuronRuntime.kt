@@ -13,21 +13,31 @@ class OfficialNeuronRuntime private constructor(
     val outputSizes: LongArray,
     val optionsSummary: String,
 ) : AutoCloseable {
+    private val inputBuffers = inputSizes.map { size ->
+        ByteBuffer.allocateDirect(size.toInt()).order(ByteOrder.nativeOrder())
+    }
+    private val outputBuffers = outputSizes.map { size ->
+        ByteBuffer.allocateDirect(size.toInt()).order(ByteOrder.nativeOrder())
+    }
+    private val outputBindings = outputBuffers.mapIndexed { index, buffer -> index to buffer }.toMap()
+
+    @Synchronized
     fun run(inputs: List<ByteArray>, copyOutputs: Boolean = true): List<ByteArray> {
         require(inputs.size == inputSizes.size) {
             "input count mismatch runtime=${inputSizes.size} actual=${inputs.size}"
         }
-        val inputBuffers = inputs.mapIndexed { index, bytes ->
+        inputs.forEachIndexed { index, bytes ->
             require(bytes.size.toLong() == inputSizes[index]) {
                 "input[$index] bytes mismatch runtime=${inputSizes[index]} actual=${bytes.size}"
             }
-            directBuffer(bytes)
+            inputBuffers[index].apply {
+                clear()
+                put(bytes)
+                rewind()
+            }
         }
-        val outputBuffers = outputSizes.map { size ->
-            ByteBuffer.allocateDirect(size.toInt()).order(ByteOrder.nativeOrder())
-        }
-        val outputs = outputBuffers.mapIndexed { index, buffer -> index to buffer }.toMap()
-        interpreter.runForMultipleInputsOutputs(inputBuffers.toTypedArray(), outputs)
+        outputBuffers.forEach(ByteBuffer::clear)
+        interpreter.runForMultipleInputsOutputs(inputBuffers.toTypedArray(), outputBindings)
         if (!copyOutputs) {
             return emptyList()
         }
@@ -92,11 +102,5 @@ class OfficialNeuronRuntime private constructor(
                 },
             )
         }
-
-        private fun directBuffer(bytes: ByteArray): ByteBuffer =
-            ByteBuffer.allocateDirect(bytes.size).order(ByteOrder.nativeOrder()).also {
-                it.put(bytes)
-                it.rewind()
-            }
     }
 }

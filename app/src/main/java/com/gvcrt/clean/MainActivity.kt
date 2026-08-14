@@ -3,10 +3,12 @@ package com.gvcrt.clean
 import android.app.Activity
 import android.graphics.BitmapFactory
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
 import android.view.View
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -27,6 +29,9 @@ class MainActivity : Activity() {
     private var running = false
     private var imageRunner: ImageInferenceRunner? = null
     private var imageRunnerBackend: OnnxBackend? = null
+    private var smallOfflineVideoRunner: SmallOfflineVideoRunner? = null
+    private var pendingVideoUri: Uri? = null
+    private lateinit var videoStopButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,6 +81,12 @@ class MainActivity : Activity() {
         val pPriorTfliteProbeButton = moduleButton("P Prior\nTFLite probe") {
             startTests(listOf("p_prior_tflite_probe"))
         }
+        val smallVideoButton = moduleButton("Small video\noffline") {
+            openVideoPicker()
+        }
+        videoStopButton = moduleButton("Stop\nvideo") {
+            smallOfflineVideoRunner?.cancel()
+        }.apply { isEnabled = false }
         moduleButtons = buildList {
             addAll(
                 listOf(
@@ -97,6 +108,7 @@ class MainActivity : Activity() {
                         priorNpuSpeedButton,
                         priorTfliteProbeButton,
                         pPriorTfliteProbeButton,
+                        smallVideoButton,
                     )
                 )
             }
@@ -137,6 +149,13 @@ class MainActivity : Activity() {
             addView(priorTfliteProbeButton, buttonLayoutParams())
             addView(pPriorTfliteProbeButton, buttonLayoutParams())
         }
+        val smallVideoControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(16, 0, 16, 0)
+            addView(smallVideoButton, buttonLayoutParams())
+            addView(videoStopButton, buttonLayoutParams())
+        }
         inputImage = comparisonImageView()
         reconImage = comparisonImageView()
         reconTitle = comparisonTitle("Reconstruction")
@@ -155,11 +174,13 @@ class MainActivity : Activity() {
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            fitsSystemWindows = true
             addView(controls)
             addView(speedControls)
             addView(projectControls)
             if (!isOnnxDemo) {
                 addView(priorNpuControls)
+                addView(smallVideoControls)
             }
             addView(
                 imageComparison,
@@ -201,6 +222,28 @@ class MainActivity : Activity() {
         }
     }
 
+    @Deprecated("Uses the platform document picker for broad Android compatibility")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != VIDEO_PICK_REQUEST || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val takeFlags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+        runCatching { contentResolver.takePersistableUriPermission(uri, takeFlags) }
+        pendingVideoUri = uri
+        startTests(listOf("small_offline_video"))
+    }
+
+    private fun openVideoPicker() {
+        startActivityForResult(
+            Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "video/*"
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            },
+            VIDEO_PICK_REQUEST,
+        )
+    }
+
     private fun requestedModules(intent: Intent): List<String> {
         val requested = when {
             intent.getBooleanExtra("temporalReferenceTest", false) -> listOf("temporal_reference")
@@ -225,6 +268,7 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("iPriorTfliteProbe", false) -> listOf("i_prior_tflite_probe")
             intent.getBooleanExtra("pPriorTfliteProbe", false) -> listOf("p_prior_tflite_probe")
             intent.getBooleanExtra("enterpriseTfliteTest", false) -> listOf("enterprise_tflite")
+            intent.getBooleanExtra("smallOfflineVideoTest", false) -> listOf("small_offline_video")
             else -> emptyList()
         }
         return if (BuildConfig.DEPLOYMENT_PATH != "onnx_demo" || requested.all(ONNX_DEMO_MODULES::contains)) {
@@ -298,6 +342,10 @@ class MainActivity : Activity() {
         }
         running = true
         moduleButtons.forEach { it.isEnabled = false }
+        videoStopButton.isEnabled = requested.contains("small_offline_video")
+        if (requested.contains("small_offline_video")) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         output.text = "GVC-RT clean deployment\n"
         imageComparison.visibility = View.GONE
         imageSummary.visibility = View.GONE
@@ -420,6 +468,23 @@ class MainActivity : Activity() {
                                 relaxFp32 = intent.getBooleanExtra("enterpriseTfliteRelaxFp32", false),
                             )
                         }
+                        moduleName == "small_offline_video" -> {
+                            val uri = pendingVideoUri
+                                ?: intent.getStringExtra("videoUri")?.let(Uri::parse)
+                                ?: intent.getStringExtra("videoPath")?.let { Uri.fromFile(File(it)) }
+                                ?: error("smallOfflineVideoTest requires videoUri/videoPath or a picked video")
+                            val runner = SmallOfflineVideoRunner(this, ::emit, ::showImageComparison)
+                            smallOfflineVideoRunner = runner
+                            MemorySampler(this, ::emit).use { memory ->
+                                memory.begin("small_offline_video")
+                                runner.run(
+                                    inputUri = uri,
+                                    maxDurationSeconds = intent.getIntExtra("smallOfflineVideoSeconds", 60),
+                                    h264Bitrate = intent.getIntExtra("smallOfflineVideoBitrate", 8_000_000),
+                                )
+                                memory.mark("video_complete")
+                            }
+                        }
                         moduleName.endsWith("_speed") -> {
                             ModuleSpeedBenchmarks(
                                 this,
@@ -448,7 +513,10 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     running = false
                     moduleButtons.forEach { it.isEnabled = true }
+                    videoStopButton.isEnabled = false
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
+                smallOfflineVideoRunner = null
             }
         }.start()
     }
@@ -499,6 +567,14 @@ class MainActivity : Activity() {
             line.startsWith("image_speed stage=decode_core") -> {
                 imageSummaryLines["Decode"] = "Decode core: ${line.valueAfter("ms")} ms"
             }
+            line.startsWith("small_offline_video_speed stage=model_summary") -> {
+                imageSummaryLines["Small speed"] =
+                    "Small model: ${line.valueAfter("mean_frame_ms")} ms/frame, ${line.valueAfter("fps")} FPS"
+            }
+            line.startsWith("small_offline_video_quality") -> {
+                imageSummaryLines["Small PSNR"] =
+                    "Video PSNR: ${line.valueAfter("mean_psnr_db")} dB (mean)"
+            }
         }
         if (imageSummaryLines.isNotEmpty()) {
             imageSummary.text = imageSummaryLines.values.joinToString("\n")
@@ -517,6 +593,8 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        smallOfflineVideoRunner?.close()
+        smallOfflineVideoRunner = null
         imageRunner?.close()
         imageRunner = null
         super.onDestroy()
@@ -524,6 +602,7 @@ class MainActivity : Activity() {
 
     companion object {
         const val TAG = "GVC_RT_CLEAN"
+        private const val VIDEO_PICK_REQUEST = 4102
         private val ONNX_DEMO_MODULES = setOf(
             "temporal_reference",
             "complete_encoder",
