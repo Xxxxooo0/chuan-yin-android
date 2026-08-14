@@ -87,7 +87,7 @@ def output_shapes(record: dict[str, Any]) -> Any:
     )
 
 
-def build_readme() -> str:
+def build_readme(target: str) -> str:
     return """# GVC-RT DLA编解码器（270p）
 
 ## 运行配置
@@ -96,7 +96,7 @@ def build_readme() -> str:
 - QP: `0`
 - Tensor布局：`NHWC`
 - 外部Tensor类型：`FP32`
-- 目标设备：`MDLA 5.3`
+- 目标设备：`{target}`
 
 ## 帧处理流程
 
@@ -148,7 +148,7 @@ I帧重建结果
 
 `manifest.json` 是输入输出Tensor接口的权威清单。测试前使用
 `SHA256SUMS.txt` 校验所有交付文件。
-"""
+""".format(target=target)
 
 
 def main() -> None:
@@ -156,6 +156,8 @@ def main() -> None:
     parser.add_argument("--export-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--archive", type=Path, default=None)
+    parser.add_argument("--package-name", default="gvcrt_dla_codec_270p_qp0")
+    parser.add_argument("--target", default="MDLA 5.3")
     args = parser.parse_args()
 
     export_root = args.export_root.resolve()
@@ -193,19 +195,19 @@ def main() -> None:
         )
 
     delivery_manifest = {
-        "package": "gvcrt_dla_codec_270p_qp0",
+        "package": args.package_name,
         "resolution": {"height": 256, "width": 512},
         "qp": 0,
         "layout": "NHWC",
         "io_dtype": "FP32",
-        "target": "MDLA 5.3",
+        "target": args.target,
         "latent_bridge": "direct",
         "models": published,
     }
     (output_dir / "manifest.json").write_text(
         json.dumps(delivery_manifest, indent=2), encoding="utf-8"
     )
-    (output_dir / "README.md").write_text(build_readme(), encoding="utf-8")
+    (output_dir / "README.md").write_text(build_readme(args.target), encoding="utf-8")
 
     checksum_paths = sorted([*models_dir.glob("*.dla"), output_dir / "manifest.json", output_dir / "README.md"])
     checksum_text = "".join(

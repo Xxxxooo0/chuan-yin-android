@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -84,12 +85,83 @@ def find_tool(explicit: str, name: str) -> str:
     return found
 
 
+def compile_dla(
+    name: str,
+    tflite_path: Path,
+    dla_path: Path,
+    logs: Path,
+    ncc: str,
+    ncc_env: Dict[str, str],
+    arch: str,
+) -> Tuple[Dict[str, Any], str]:
+    ncc_flags = ["--arch", arch, "--opt-bw", "--relax-fp32"]
+    with tempfile.TemporaryDirectory(prefix="gvc-rt-small-ncc-") as temporary:
+        public_dir = Path(temporary)
+        public_tflite = public_dir / (name + ".tflite")
+        public_dla = public_dir / (name + ".dla")
+        shutil.copy2(str(tflite_path), str(public_tflite))
+        check_rc, check_text = run(
+            [ncc, str(public_tflite)] + ncc_flags + ["--check-target-only"],
+            logs / "ncc_check_target.log",
+            ncc_env,
+        )
+        plan_rc, plan_text = run(
+            [ncc, str(public_tflite)] + ncc_flags + ["--show-exec-plan", "--show-memory-summary"],
+            logs / "ncc_exec_plan.log",
+            ncc_env,
+        )
+        compile_rc, compile_text = run(
+            [ncc, str(public_tflite)] + ncc_flags + [
+                "--gen-debug-info", "--show-exec-plan", "--show-memory-summary", "-d", str(public_dla)
+            ],
+            logs / "ncc_compile_dla.log",
+            ncc_env,
+        )
+        if compile_rc == 0 and public_dla.is_file():
+            shutil.copy2(str(public_dla), str(dla_path))
+
+    target_lines = [line.strip() for line in plan_text.splitlines() if "Target:" in line]
+    expected_target = "MDLA_" + arch.replace("mdla", "", 1).replace(".", "_")
+    mdla_only = bool(target_lines) and all(expected_target in line for line in target_lines)
+    result = {
+        "check_rc": check_rc,
+        "plan_rc": plan_rc,
+        "compile_rc": compile_rc,
+        "execution_targets": target_lines,
+        "mdla_only": mdla_only,
+        "dla": str(dla_path) if dla_path.is_file() else None,
+        "dla_sha256": sha256(dla_path) if dla_path.is_file() else None,
+    }
+    result["offline_compile_ok"] = (
+        check_rc == 0 and plan_rc == 0 and compile_rc == 0 and dla_path.is_file() and mdla_only
+    )
+    return result, check_text + "\n" + plan_text + "\n" + compile_text
+
+
 def nhwc_to_nchw(value: torch.Tensor) -> torch.Tensor:
     return value.permute(0, 3, 1, 2).contiguous()
 
 
 def nchw_to_nhwc(value: torch.Tensor) -> torch.Tensor:
     return value.permute(0, 2, 3, 1).contiguous()
+
+
+def install_torch_compatibility() -> None:
+    from torch.nn.modules import utils as module_utils
+
+    if hasattr(module_utils, "consume_prefix_in_state_dict_if_present"):
+        return
+
+    def consume_prefix_in_state_dict_if_present(state_dict: Dict[str, Any], prefix: str) -> None:
+        for key in list(state_dict.keys()):
+            if key.startswith(prefix):
+                state_dict[key[len(prefix) :]] = state_dict.pop(key)
+        if hasattr(state_dict, "_metadata"):
+            for key in list(state_dict._metadata.keys()):
+                if key and (key == prefix.replace(".", "") or key.startswith(prefix)):
+                    state_dict._metadata[key[len(prefix) :]] = state_dict._metadata.pop(key)
+
+    module_utils.consume_prefix_in_state_dict_if_present = consume_prefix_in_state_dict_if_present
 
 
 def space_to_depth(value: torch.Tensor, factor: int) -> torch.Tensor:
@@ -162,6 +234,7 @@ class DecoderSynthesisNhwc(nn.Module):
 def load_model(source_root: Path, checkpoint: Path) -> nn.Module:
     sys.path.insert(0, str(source_root))
     sys.path.insert(0, str(source_root / "video"))
+    install_torch_compatibility()
     from src.models.dmc_6.dmc_61sb import DMC
     from src.utils.stream_helper import get_state_dict
 
@@ -215,7 +288,7 @@ def export_one(
     fixtures = output_dir / "fixtures" / name
     fixtures.mkdir(parents=True, exist_ok=True)
     wrapper = wrapper.cpu().eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         expected_value = wrapper(*inputs)
         expected = expected_value if isinstance(expected_value, tuple) else (expected_value,)
         traced = torch.jit.trace(wrapper, inputs, strict=False)
@@ -250,35 +323,30 @@ def export_one(
         },
     }
 
-    if name == "decoder_synthesis":
-        onnx_path = output_dir / (name + ".onnx")
-        torch.onnx.export(
-            wrapper,
-            inputs,
-            str(onnx_path),
-            input_names=list(input_names),
-            output_names=list(output_names),
-            opset_version=12,
-            do_constant_folding=True,
-        )
-        record.update({"onnx": str(onnx_path), "onnx_sha256": sha256(onnx_path)})
-        converter_command = [
-            onnx_converter,
-            "--input_model_file", str(onnx_path),
-            "--output_file", str(tflite_path),
-            "--output_file_format", "tflite",
-            "--input_names", ",".join(input_names),
-            "--input_shapes", ":".join(",".join(str(dim) for dim in value.shape) for value in inputs),
-            "--output_names", ",".join(output_names),
-            "--tflite_op_export_spec", "builtin_first",
-        ]
-    else:
-        converter_command = [
-            pytorch_converter,
-            "--input_script_module_file", str(pt_path),
-            "--output_file", str(tflite_path),
-            "--input_shapes", ":".join(",".join(str(dim) for dim in value.shape) for value in inputs),
-        ]
+    # NeuroPilot 7.0.8 ships MTK Converter 7.16, whose PyTorch importer
+    # rejects torch >= 2.0. Export ONNX in the source-compatible process and
+    # keep the MTK conversion isolated from that PyTorch version constraint.
+    onnx_path = output_dir / (name + ".onnx")
+    torch.onnx.export(
+        wrapper,
+        inputs,
+        str(onnx_path),
+        input_names=list(input_names),
+        output_names=list(output_names),
+        opset_version=12,
+        do_constant_folding=True,
+    )
+    record.update({"onnx": str(onnx_path), "onnx_sha256": sha256(onnx_path)})
+    converter_command = [
+        onnx_converter,
+        "--input_model_file", str(onnx_path),
+        "--output_file", str(tflite_path),
+        "--output_file_format", "tflite",
+        "--input_names", ",".join(input_names),
+        "--input_shapes", ":".join(",".join(str(dim) for dim in value.shape) for value in inputs),
+        "--output_names", ",".join(output_names),
+        "--tflite_op_export_spec", "builtin_first",
+    ]
     converter_rc, _ = run(converter_command, logs / "converter.log")
     record.update({"converter_command": converter_command, "converter_rc": converter_rc})
     if converter_rc != 0 or not tflite_path.is_file():
@@ -308,45 +376,15 @@ def export_one(
         record["precision_passed"] = False
         record["precision_error"] = runner_text[-2000:]
 
-    ncc_flags = ["--arch", arch, "--opt-bw", "--relax-fp32"]
-    check_rc, check_text = run(
-        [ncc, str(tflite_path)] + ncc_flags + ["--check-target-only"],
-        logs / "ncc_check_target.log",
-        ncc_env,
-    )
-    plan_rc, plan_text = run(
-        [ncc, str(tflite_path)] + ncc_flags + ["--show-exec-plan", "--show-memory-summary"],
-        logs / "ncc_exec_plan.log",
-        ncc_env,
-    )
-    compile_rc, compile_text = run(
-        [ncc, str(tflite_path)] + ncc_flags + [
-            "--gen-debug-info", "--show-exec-plan", "--show-memory-summary", "-d", str(dla_path)
-        ],
-        logs / "ncc_compile_dla.log",
-        ncc_env,
-    )
-    target_lines = [line.strip() for line in plan_text.splitlines() if "Target:" in line]
-    mdla_only = bool(target_lines) and all("MDLA_5_3" in line for line in target_lines)
-    record.update(
-        {
-            "check_rc": check_rc,
-            "plan_rc": plan_rc,
-            "compile_rc": compile_rc,
-            "execution_targets": target_lines,
-            "mdla_only": mdla_only,
-            "dla": str(dla_path) if dla_path.is_file() else None,
-            "dla_sha256": sha256(dla_path) if dla_path.is_file() else None,
-        }
-    )
-    record["offline_compile_ok"] = check_rc == 0 and plan_rc == 0 and compile_rc == 0 and dla_path.is_file()
+    compile_result, compile_text = compile_dla(name, tflite_path, dla_path, logs, ncc, ncc_env, arch)
+    record.update(compile_result)
     record["status"] = "ok" if record["offline_compile_ok"] and record["precision_passed"] else "failed"
     if record["status"] != "ok":
-        record["ncc_tail"] = (check_text + "\n" + plan_text + "\n" + compile_text)[-4000:]
+        record["ncc_tail"] = compile_text[-4000:]
     return record
 
 
-def build_readme() -> str:
+def build_readme(target: str) -> str:
     return """# GVC-RT-Small DLA Codec (270p / QP0)
 
 ## 固定配置
@@ -356,7 +394,7 @@ def build_readme() -> str:
 - QP index：0
 - Tensor 布局：NHWC
 - 外部 Tensor 类型：FP32
-- 目标：MDLA 5.3 离线 DLA
+- 目标：{target} 离线 DLA
 
 ## 调用流程
 
@@ -377,11 +415,17 @@ latent_y + ctx + memory
 ```
 
 下一帧使用 `next_ref_feature` 作为新的 `ref_feature`。`ctx_t` 是与原模型接口一致的时序先验输出，当前直通重建链路不消费它。具体 Tensor 名称、shape、SHA256 以 `manifest.json` 为准。
-"""
+""".format(target=target)
 
 
-def package(output_dir: Path, records: List[Dict[str, Any]], checkpoint: Path, q_index: int) -> Path:
-    package_name = "gvc-rt-small_dla_codec_270p_qp0"
+def package(
+    output_dir: Path,
+    records: List[Dict[str, Any]],
+    checkpoint: Path,
+    q_index: int,
+    package_name: str,
+    target_label: str,
+) -> Path:
     delivery = output_dir / package_name
     models = delivery / "models"
     if delivery.exists():
@@ -397,14 +441,14 @@ def package(output_dir: Path, records: List[Dict[str, Any]], checkpoint: Path, q
         if record.get("status") != "ok":
             raise RuntimeError("cannot package failed model: {}".format(record["name"]))
         source = Path(record["dla"])
-        target = models / publish_names[record["name"]]
-        shutil.copy2(str(source), str(target))
+        published_path = models / publish_names[record["name"]]
+        shutil.copy2(str(source), str(published_path))
         published.append(
             {
-                "name": target.stem,
-                "file": "models/" + target.name,
-                "bytes": target.stat().st_size,
-                "sha256": sha256(target),
+                "name": published_path.stem,
+                "file": "models/" + published_path.name,
+                "bytes": published_path.stat().st_size,
+                "sha256": sha256(published_path),
                 "inputs": record["inputs"],
                 "outputs": record["outputs"],
                 "offline_compile_verified": True,
@@ -420,12 +464,12 @@ def package(output_dir: Path, records: List[Dict[str, Any]], checkpoint: Path, q
         "fixed_q_index": q_index,
         "layout": "NHWC",
         "io_dtype": "FP32",
-        "target": "MDLA 5.3",
+        "target": target_label,
         "initial_reference": {"name": "ref_feature", "shape": [1, 32, 64, 96], "value": 0.0},
         "models": published,
     }
     (delivery / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    (delivery / "README.md").write_text(build_readme(), encoding="utf-8")
+    (delivery / "README.md").write_text(build_readme(target_label), encoding="utf-8")
     delivery_files = list(models.glob("*.dla")) + [delivery / "manifest.json", delivery / "README.md"]
     leaked = {}
     for path in delivery_files:
@@ -441,7 +485,7 @@ def package(output_dir: Path, records: List[Dict[str, Any]], checkpoint: Path, q
         "".join("{}  {}\n".format(sha256(path), path.relative_to(delivery).as_posix()) for path in checksum_paths),
         encoding="ascii",
     )
-    archive = output_dir / "gvc-rt-small_dla_codec_270p_qp0.tar.gz"
+    archive = output_dir / (package_name + ".tar.gz")
     with tarfile.open(str(archive), "w:gz") as handle:
         handle.add(str(delivery), arcname=package_name)
     return archive
@@ -459,6 +503,8 @@ def main() -> None:
     parser.add_argument("--ncc-lib-dir", type=Path, default=None)
     parser.add_argument("--arch", default="mdla5.3")
     parser.add_argument("--q-index", type=int, default=0)
+    parser.add_argument("--package-name", default="gvc-rt-small_dla_codec_270p_qp0")
+    parser.add_argument("--package-only", action="store_true")
     args = parser.parse_args()
 
     source_root = args.source_root.resolve()
@@ -467,17 +513,58 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     if not checkpoint.is_file():
         raise FileNotFoundError("missing checkpoint: {}".format(checkpoint))
+    ncc = find_tool(args.ncc_tflite, "ncc-tflite")
+    ncc_lib_dir = args.ncc_lib_dir or Path(ncc).resolve().parent.parent / "lib"
+    ncc_env = os.environ.copy()
+    ncc_env["LD_LIBRARY_PATH"] = str(ncc_lib_dir) + os.pathsep + ncc_env.get("LD_LIBRARY_PATH", "")
+    if args.package_only:
+        manifest_path = output_dir / "gvc-rt-small-export-manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError("missing export manifest: {}".format(manifest_path))
+        export_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        records = export_manifest.get("records", [])
+        if len(records) != 3 or not all(record.get("status") == "ok" for record in records):
+            raise RuntimeError("package-only requires three successful export records")
+        for record in records:
+            name = record["name"]
+            compile_result, compile_text = compile_dla(
+                name,
+                Path(record["tflite"]),
+                output_dir / (name + ".dla"),
+                output_dir / "logs" / name,
+                ncc,
+                ncc_env,
+                args.arch,
+            )
+            record.update(compile_result)
+            record["status"] = (
+                "ok" if record["offline_compile_ok"] and record.get("precision_passed") else "failed"
+            )
+            if record["status"] != "ok":
+                record["ncc_tail"] = compile_text[-4000:]
+        manifest_path.write_text(json.dumps(export_manifest, indent=2), encoding="utf-8")
+        if not all(record.get("status") == "ok" for record in records):
+            failed = [record["name"] for record in records if record.get("status") != "ok"]
+            raise RuntimeError("sanitized DLA recompile failed: {}".format(", ".join(failed)))
+        target_label = "MDLA " + args.arch.replace("mdla", "", 1)
+        archive = package(
+            output_dir,
+            records,
+            checkpoint,
+            args.q_index,
+            args.package_name,
+            target_label,
+        )
+        print("package={}".format(output_dir / args.package_name), flush=True)
+        print("archive={}".format(archive), flush=True)
+        print("archive_sha256={}".format(sha256(archive)), flush=True)
+        return
     pytorch_converter = find_tool(args.pytorch_converter, "mtk_pytorch_converter")
     onnx_converter = find_tool(args.onnx_converter, "mtk_onnx_converter")
-    ncc = find_tool(args.ncc_tflite, "ncc-tflite")
     tflite_python = args.tflite_python or str(Path(pytorch_converter).resolve().parent / "python")
     runner = source_root / "video/conversion/_exporter/_mediatek_tflite_runner.py"
     if not runner.is_file():
         raise FileNotFoundError("missing MediaTek TFLite runner: {}".format(runner))
-    ncc_lib_dir = args.ncc_lib_dir or Path(ncc).resolve().parent.parent / "lib"
-    ncc_env = os.environ.copy()
-    ncc_env["LD_LIBRARY_PATH"] = str(ncc_lib_dir) + os.pathsep + ncc_env.get("LD_LIBRARY_PATH", "")
-
     torch.manual_seed(0)
     model = load_model(source_root, checkpoint).cpu()
     if not 0 <= args.q_index < int(model.q_feature.shape[0]):
@@ -486,10 +573,10 @@ def main() -> None:
     ref_feature = torch.zeros((1, 32, 64, 96), dtype=torch.float32)
     frame = torch.rand((1, 256, 512, 3), dtype=torch.float32)
     temporal = TemporalReferenceNhwc(model, args.q_index)
-    with torch.inference_mode():
+    with torch.no_grad():
         ctx, ctx_t, memory = temporal(ref_feature)
     encoder = EncoderAnalysisNhwc(model, args.q_index)
-    with torch.inference_mode():
+    with torch.no_grad():
         latent_y = encoder(frame, ctx)
     decoder = DecoderSynthesisNhwc(model, args.q_index)
 
@@ -542,8 +629,16 @@ def main() -> None:
     print("wrote {}".format(manifest_path), flush=True)
 
     if all(record.get("status") == "ok" for record in records):
-        archive = package(output_dir, records, checkpoint, args.q_index)
-        print("package={}".format(output_dir / "gvc-rt-small_dla_codec_270p_qp0"), flush=True)
+        target = "MDLA " + args.arch.replace("mdla", "", 1)
+        archive = package(
+            output_dir,
+            records,
+            checkpoint,
+            args.q_index,
+            args.package_name,
+            target,
+        )
+        print("package={}".format(output_dir / args.package_name), flush=True)
         print("archive={}".format(archive), flush=True)
         print("archive_sha256={}".format(sha256(archive)), flush=True)
     else:

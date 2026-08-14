@@ -114,6 +114,7 @@ class Candidate:
     outputs_nchw: tuple[tuple[str, Shape], ...]
     build: Callable[[nn.Module, int], nn.Module]
     direct_nhwc: bool = False
+    check_trace: bool = True
 
 
 CANDIDATES = (
@@ -317,7 +318,12 @@ def export_candidate(
 
     pt_path = output_dir / f"{candidate.name}_fp32.pt"
     with torch.no_grad():
-        scripted = torch.jit.trace(module, samples, strict=False)
+        scripted = torch.jit.trace(
+            module,
+            samples,
+            strict=False,
+            check_trace=candidate.check_trace,
+        )
         actual = scripted(*samples)
         actual_tuple = actual if isinstance(actual, tuple) else (actual,)
         actual_shapes = [list(tensor.shape) for tensor in actual_tuple]
@@ -339,6 +345,7 @@ def export_candidate(
         "actual_torchscript_output_shapes_nhwc": actual_shapes,
         "torchscript": str(pt_path),
         "torchscript_sha256": sha256(pt_path),
+        "torchscript_trace_check": candidate.check_trace,
     }
 
     tflite_path = output_dir / f"{candidate.name}_fp32.tflite"
