@@ -28,6 +28,7 @@ models/small/
 # Local SDKs, inspection output, and temporary workspaces
 .codex_inspect/
 .tmp_*/
+model_test/
 local_archive/
 sdk/
 outputs/

@@ -114,8 +114,7 @@ python -u server_tools/append_p_rans_decode_custom_ops.py \
   --output outputs/p_entropy_decoder_merged_rans/p_entropy_decode_merged_rans.tflite
 ```
 
-打包目录不包含四张 merged+rANS 模型。这些模型单独保存到本地模型分支的
-`models/large/local_models/gvc-rt-large/online_entropy/`。
+上述 QP0 基础包（`gvc-rt-large_tflite_codec_270p_qp0_with_inputs`）不包含四张 merged+rANS 模型；公共图单独保存到本地模型分支的 `models/large/online_entropy/`，并登记在 `SHA256SUMS.txt`。固定 QP9 正式包由 `package_large_fixed_qp.py` 统一打包，已包含这四张图，设备部署时无需再单独推送。
 
 ## Android 部署
 
@@ -125,10 +124,10 @@ $root = '/sdcard/Android/data/com.gvcrt.clean.mtkoffline/files/enterprise_tflite
 
 & $adb install -r .\app\build\outputs\apk\mtkOffline\debug\app-mtkOffline-debug.apk
 & $adb push D:\path\to\unpacked-package\. $root
-& $adb push .\models\large\local_models\gvc-rt-large\online_entropy\i_entropy_prior_merged_rans.tflite "$root/models/i_entropy_prior_merged_rans.tflite"
-& $adb push .\models\large\local_models\gvc-rt-large\online_entropy\i_entropy_decode_merged_rans.tflite "$root/models/i_entropy_decode_merged_rans.tflite"
-& $adb push .\models\large\local_models\gvc-rt-large\online_entropy\p_entropy_prior_merged_rans.tflite "$root/models/p_entropy_prior_merged_rans.tflite"
-& $adb push .\models\large\local_models\gvc-rt-large\online_entropy\p_entropy_decode_merged_rans.tflite "$root/models/p_entropy_decode_merged_rans.tflite"
+& $adb push .\models\large\online_entropy\i_entropy_prior_merged_rans.tflite "$root/models/i_entropy_prior_merged_rans.tflite"
+& $adb push .\models\large\online_entropy\i_entropy_decode_merged_rans.tflite "$root/models/i_entropy_decode_merged_rans.tflite"
+& $adb push .\models\large\online_entropy\p_entropy_prior_merged_rans.tflite "$root/models/p_entropy_prior_merged_rans.tflite"
+& $adb push .\models\large\online_entropy\p_entropy_decode_merged_rans.tflite "$root/models/p_entropy_decode_merged_rans.tflite"
 ```
 
 ## 测试入口
@@ -198,7 +197,7 @@ payload 的闭环；与服务器 PyTorch 原生 force-zero skip 码流互通仍�
 该模型把 `rANS z -> init prior -> rANS y0 -> stage1 -> rANS y1 -> stage2 ->
 rANS y2 -> stage3 -> rANS y3 -> y_hat` 放入一张 TFLite 和一个 Interpreter。连续
 prior 算子由 NeuronDelegate 处理，5 个串行 rANS custom op 保持原生 CPU。旧四图实现
-已经删除，正式 `Large I decode` 入口只使用该单图。服务器生成命令见“服务器导出与打包”。
+已经删除，正式 `Large I decode` 入口只使用该单图。P 侧同结构单图为 `p_entropy_decode_merged_rans.tflite`，对应入口 `largePEntropyDecodeTest` 与 `largePEntropyDecodeSpeedTest`。服务器生成命令见“服务器导出与打包”。
 
 将结果放到设备 Large 包的 `models/i_entropy_decode_merged_rans.tflite` 后运行：
 
@@ -273,3 +272,58 @@ NAL，解码端只读取封装后的 payload，并维护独立的 Reference Fram
 `123.988 ms/帧`、`8.065 fps`，平均/最低/末帧 PSNR 分别为
 `23.022/22.537/23.241 dB`，完整 I/P 编码、封装和独立解码通过。首次在线创建约
 `108.9 s`，不计入稳态速度。同条件动态 QP9 包为 `135.759 ms/帧、7.366 fps`。
+
+## 1 分钟离线视频演示
+
+应用中的 `Large video 1 min` 使用系统文件选择器读取本地视频，最多处理前 60 秒。流程分两遍执行，
+避免在内存中保留全部 FP32 帧：
+
+1. `MediaCodec` 解码输入视频，逐帧缩放到 `512x256`，执行 GVC 编码与编码侧本地重建，保存
+   `encoded_video.gvc`。
+2. 重新打开输入视频，从 `.gvc` 独立解码，校验编码侧/解码侧重建 SHA，计算 H.264 写出前的
+   模型域 PSNR，并生成无音频的 `reconstructed.mp4`。
+
+默认 H.264 码率为 8 Mbps，使用源视频帧率和时间戳。输出位于：
+
+```text
+/sdcard/Android/data/com.gvcrt.clean.mtkoffline/files/
+  enterprise_tflite_codec/large/video_demo/<timestamp>/
+```
+
+目录包含 `encoded_video.gvc`、`reconstructed.mp4`、末帧输入/重建 PNG 和 `run_report.json`。
+界面运行期间会显示当前原图、重建图、帧号和 PSNR；`Stop video` 可终止长序列。
+
+通过 adb 使用应用 external files 下的视频：
+
+```powershell
+$adb = ".\sdk\platform-tools\adb.exe"
+& $adb shell svc power stayon true
+& $adb shell input keyevent KEYCODE_WAKEUP
+& $adb shell am start -n com.gvcrt.clean.mtkoffline/com.gvcrt.clean.MainActivity `
+  --ez largeOfflineVideoTest true `
+  --es videoPath /sdcard/Android/data/com.gvcrt.clean.mtkoffline/files/input/demo.mp4 `
+  --ei largeOfflineVideoSeconds 60 `
+  --ei largeOfflineVideoBitrate 8000000
+& $adb logcat -d -s GVC_RT_CLEAN:I
+```
+
+`large_offline_video_speed phase=gvc_model_total` 仅统计 GVC 神经网络与熵编解码，不包含首次
+Neuron 在线创建、源视频解码、PSNR、界面刷新或 H.264 封装。外围耗时单独写入 JSON 报告。
+
+## 服务器基准与质量指标
+
+服务器端用同一 ParkScene 序列评估 Large/Small 的率失真与感知质量，输出 JSON 报告并绘制 RD 曲线：
+
+```bash
+# PyTorch 主线在 ParkScene 序列上按 QP 基准，输出码率/PSNR/MS-SSIM/LPIPS/DISTS 报告
+python -u server_tools/benchmark_large_park_scene_sequence.py --help
+
+# 对保存的 RGB 重建图计算 LPIPS/DISTS
+python -u server_tools/compute_perceptual_metrics.py --help
+
+# 汇总基准报告并绘制率失真曲线
+python -u server_tools/plot_park_rd_curve.py --help
+```
+
+Large 的 NeuroPilot 7.0.8 + mdla50 企业包构建由 `server_tools/build_large_np708_mdla50_scaled_variance.sh`
+统一编排，产物为 `gvc-rt-large_dla_codec_270p_qp0_np708_mdla50_scaled_variance*`。

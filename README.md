@@ -21,6 +21,10 @@ cd D:\android\ceshi\GVC-RT_clean_android
 
 模型推理、精度比对和性能测试不在本机运行：Android 测试通过 `adb` 完成，PyTorch 导出和服务器精度验证通过 `server_tools/` 在远端完成。
 
+## 模型测试工作区
+
+新模型或新包必须先在 `model_test/<日期时间>-<large|small>-<目的>/` 下按 [AGENTS.md](AGENTS.md) 的规范完成精度与速度验证，通过后才允许替换 `models/large/`、`models/small/` 中的正式包，并同步更新对应模型目录的 `README.md` 与 `SHA256SUMS.txt`；测试目录随后整体删除。
+
 ## Android 安装
 
 ```powershell
@@ -31,4 +35,12 @@ $adb = '.\sdk\platform-tools\adb.exe'
 & $adb logcat -d -s GVC_RT_CLEAN:I
 ```
 
-MTK APK 的 application ID 为 `com.gvcrt.clean.mtkoffline`；该 flavor 名称沿用历史目录名，当前实际运行模式为在线编译。服务端导出、离线审计和企业交付命令见 [server_tools/README.md](server_tools/README.md)。
+MTK 在线部署需要先把解压后的模型包推送到设备（包目录与设备路径见 [models/README.md](models/README.md)），再触发测试：
+
+```powershell
+& $adb install -r .\app\build\outputs\apk\mtkOffline\debug\app-mtkOffline-debug.apk
+& $adb shell am start -n com.gvcrt.clean.mtkoffline/com.gvcrt.clean.MainActivity --ez enterpriseTfliteTest true --es enterpriseTfliteVariant large
+& $adb logcat -d -s GVC_RT_CLEAN:I
+```
+
+MTK APK 的 application ID 为 `com.gvcrt.clean.mtkoffline`；该 flavor 名称沿用历史目录名，当前实际运行模式为在线编译。全部 adb 测试入口（含 Large 主流程与 1 分钟离线视频演示）见 [docs/large-online-deployment.md](docs/large-online-deployment.md)，服务端导出、离线审计和企业交付命令见 [server_tools/README.md](server_tools/README.md)。

@@ -91,6 +91,44 @@ Android 将生成文件放入 Large 在线包的 `models/` 后，通过
 长度，输出 `z_hat`、四阶段符号/scales 和最终 `y_hat`。该变体用于减少四个 Interpreter
 之间的调度和 tensor 拷贝，rANS 仍由原生 CPU 执行。
 
+## Large 固定 QP9 在线包打包
+
+固定 QP9 连续图由 `export_three_modules_offline_nhwc.py` 与
+`export_decoder_full_norm_rewrite_nhwc.py` 从同一 I/P checkpoint 导出，`package_large_fixed_qp.py`
+将六张连续图与四张 entropy+rANS 图组成正式包
+`gvc-rt-large_tflite_online_fixed_qp9_270p.tar.gz`。完整命令见
+[Large 在线部署](../docs/large-online-deployment.md)。
+
+## 企业 TFLite 包转 DLA 与视频序列交付
+
+`compile_tflite_package_to_dla.py` 将已验证的企业 TFLite 包整体编译为 NCC 验证的离线 DLA 包
+（`--arch mdlaX.Y`、`--opt-bw`、`--relax-fp32`）。`package_enterprise_video_sequence.py`
+将已验证 DLA 模型与链式视频序列输入（Large 为 `i_encoder/i_decoder + temporal_from_frame + temporal_from_feature + p_encoder/p_decoder`）合并为交付包。
+
+```bash
+python server_tools/compile_tflite_package_to_dla.py --help
+python server_tools/package_enterprise_video_sequence.py --help
+```
+
+## 服务器基准与质量指标
+
+`benchmark_large_park_scene_sequence.py` 在 ParkScene 序列上运行 Large PyTorch 主线，输出
+码率、PSNR、MS-SSIM、LPIPS、DISTS 的 JSON 报告；`compute_perceptual_metrics.py` 对保存的
+RGB 重建图计算 LPIPS/DISTS；`plot_park_rd_curve.py` 汇总各 QP 报告并绘制率失真曲线。
+
+```bash
+python server_tools/benchmark_large_park_scene_sequence.py --help
+python server_tools/compute_perceptual_metrics.py --help
+python server_tools/plot_park_rd_curve.py --help
+```
+
+## np708/mdla50 构建脚本
+
+`build_large_np708_mdla50_scaled_variance.sh` 使用 NeuroPilot 7.0.8 工具链
+（`mtk_pytorch_converter` + `ncc-tflite`）构建 270p/QP0 Large 企业包，采用 FP16 稳定的
+缩放方差解码器，产物为 `gvc-rt-large_dla_codec_270p_qp0_np708_mdla50_scaled_variance*`。
+路径通过环境变量覆盖，默认值见脚本头部。
+
 ## 结果审计
 
 使用 `audit_mtk_offline_assets.py` 检查离线模型的 manifest、SHA 和 NCC 结果。`compare_enterprise_precision_outputs.py` 用企业回传的输出与参考向量生成精度报告。
