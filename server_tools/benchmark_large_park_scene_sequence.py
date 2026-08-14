@@ -63,6 +63,11 @@ def frame_psnr(reference, reconstruction):
     return float("inf") if mse == 0.0 else 10.0 * math.log10(1.0 / mse)
 
 
+def frame_rgb_numpy(value):
+    value = (value.detach().float().clamp(-1.0, 1.0) + 1.0) * 127.5
+    return value[0].cpu().numpy()
+
+
 def write_nhwc_tensor(value, path):
     array = value.detach().float().cpu().numpy().transpose(0, 2, 3, 1).copy()
     array.astype("<f4").tofile(str(path))
@@ -103,18 +108,27 @@ def main():
     parser.add_argument("--frame-count", type=int, default=240)
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--fps", type=float, default=24.0)
     parser.add_argument("--qp", type=int, default=0)
     parser.add_argument("--reset-interval", type=int, default=32)
     parser.add_argument("--force-zero-thres", type=float, default=0.12)
     parser.add_argument("--dump-boundary-frames", default="")
+    parser.add_argument("--dump-reconstruction-dir", type=Path)
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required by the original compress implementation")
     source_root = args.source_root.resolve()
+    sys.path.insert(0, str(source_root))
+    from src.utils.metrics import calc_msssim_rgb
     sequence_dir = args.sequence_dir.resolve()
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    dump_reconstruction_dir = (
+        args.dump_reconstruction_dir.resolve() if args.dump_reconstruction_dir else None
+    )
+    if dump_reconstruction_dir is not None:
+        dump_reconstruction_dir.mkdir(parents=True, exist_ok=True)
     boundary_frames = {
         int(value.strip())
         for value in args.dump_boundary_frames.split(",")
@@ -203,6 +217,18 @@ def main():
             torch.cuda.synchronize(device=device)
             elapsed_ms = (time.time() - started) * 1000.0
             value = frame_psnr(frame, decoded["x_hat"])
+            if dump_reconstruction_dir is not None:
+                reconstruction_rgb = (
+                    (decoded["x_hat"].detach().float().clamp(-1.0, 1.0) + 1.0) * 0.5
+                )
+                np.save(
+                    str(dump_reconstruction_dir / "frame_{:04d}.npy".format(index + 1)),
+                    reconstruction_rgb[0].cpu().numpy(),
+                )
+            ms_ssim = float(calc_msssim_rgb(
+                frame_rgb_numpy(frame),
+                frame_rgb_numpy(decoded["x_hat"]),
+            ))
             decode_ms.append(elapsed_ms)
             record = {
                 "frame": index + 1,
@@ -212,6 +238,7 @@ def main():
                 "encode_ms": encode_ms[index],
                 "decode_ms": elapsed_ms,
                 "psnr_db": value,
+                "ms_ssim": ms_ssim,
             }
             records.append(record)
             print(
@@ -227,28 +254,51 @@ def main():
             )
 
     psnrs = [record["psnr_db"] for record in records]
+    ms_ssims = [record["ms_ssim"] for record in records]
+    total_payload_bytes = sum(len(payload) for payload in payloads)
+    duration_seconds = args.frame_count / args.fps
     summary = {
         "source_root": str(source_root),
         "sequence_dir": str(sequence_dir),
         "frame_count": args.frame_count,
         "shape_nhwc": [1, args.height, args.width, 3],
         "qp": args.qp,
+        "fps": args.fps,
         "reset_interval": args.reset_interval,
         "force_zero_thres": args.force_zero_thres,
         "precision": "pytorch_fp16_cuda",
         "i_checkpoint_sha256": file_sha256(i_checkpoint),
         "p_checkpoint_sha256": file_sha256(p_checkpoint),
-        "payload_bytes": sum(len(payload) for payload in payloads),
+        "payload_bytes": total_payload_bytes,
+        "average_kbps": total_payload_bytes * 8 / duration_seconds / 1000.0,
+        "average_bits_per_frame": total_payload_bytes * 8 / args.frame_count,
+        "average_bpp": total_payload_bytes * 8 / (args.frame_count * args.width * args.height),
         "mean_encode_ms": float(np.mean(encode_ms)),
         "mean_decode_ms": float(np.mean(decode_ms)),
         "mean_psnr_db": float(np.mean(psnrs)),
+        "mean_ms_ssim": float(np.mean(ms_ssims)),
         "min_psnr_db": float(np.min(psnrs)),
         "final_psnr_db": float(psnrs[-1]),
         "frames": records,
     }
-    report_path = output_dir / "server_large_park_scene_240_report.json"
+    if args.frame_count > 1:
+        p_payload_bytes = sum(len(payload) for payload in payloads[1:])
+        p_duration_seconds = (args.frame_count - 1) / args.fps
+        summary["after_first_frame"] = {
+            "frame_count": args.frame_count - 1,
+            "payload_bytes": p_payload_bytes,
+            "average_kbps": p_payload_bytes * 8 / p_duration_seconds / 1000.0,
+            "average_bpp": p_payload_bytes * 8 / ((args.frame_count - 1) * args.width * args.height),
+            "mean_psnr_db": float(np.mean(psnrs[1:])),
+            "mean_ms_ssim": float(np.mean(ms_ssims[1:])),
+        }
+    report_path = output_dir / "server_large_park_scene_{}_qp{}_report.json".format(
+        args.frame_count, args.qp
+    )
     report_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    csv_path = output_dir / "server_large_park_scene_240_frames.csv"
+    csv_path = output_dir / "server_large_park_scene_{}_qp{}_frames.csv".format(
+        args.frame_count, args.qp
+    )
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(records[0].keys()))
         writer.writeheader()
@@ -256,7 +306,10 @@ def main():
     print("[server-large] summary {}".format(json.dumps({
         "frames": args.frame_count,
         "payload_bytes": summary["payload_bytes"],
+        "average_kbps": summary["average_kbps"],
+        "average_bpp": summary["average_bpp"],
         "mean_psnr_db": summary["mean_psnr_db"],
+        "mean_ms_ssim": summary["mean_ms_ssim"],
         "min_psnr_db": summary["min_psnr_db"],
         "final_psnr_db": summary["final_psnr_db"],
         "mean_encode_ms": summary["mean_encode_ms"],
