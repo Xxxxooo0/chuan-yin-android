@@ -3,7 +3,6 @@
 本目录仅提交到本地 `GVC-RT-L-models` 分支，不要将该分支推送到 Gitee。
 
 - `gvc-rt-large_tflite_online_fixed_qp9_270p.tar.gz`：当前正式在线模型包。六张连续神经网络图将 QP9 量化尺度固化为常量，并包含四张 entropy+rANS 图；Android 真机 24 帧实测 `123.988 ms/帧`、`8.065 fps`、平均 PSNR `23.022 dB`。
-- `online_entropy/i_entropy_prior_merged.tflite`：不含 rANS 的 I 帧合图，仅保留作诊断基线。
 - `online_entropy/i_entropy_prior_merged_rans.tflite`：正式 I 编码 entropy/prior+rANS 单图。
 - `online_entropy/i_entropy_decode_merged_rans.tflite`：I 帧码流解码单图，输入 rANS payload，图内串行完成 z/y rANS 解码、四阶段 prior 和 `y_hat` 恢复。Neuron 执行连续网络，rANS custom op 使用原生 CPU。Android 实测全部离散符号、CDF index、`y_hat` 和重建帧 exact；warmup 3、正式 10 次时 entropy+rANS 均值 `32.721 ms`。
 - `online_entropy/p_entropy_prior_merged_rans.tflite`：正式 P 编码 entropy/prior+rANS 单图。
