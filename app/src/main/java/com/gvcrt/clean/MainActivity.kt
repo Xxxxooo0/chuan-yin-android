@@ -1,8 +1,11 @@
 package com.gvcrt.clean
 
 import android.app.Activity
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.drawable.BitmapDrawable
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
@@ -30,6 +33,8 @@ class MainActivity : Activity() {
     private var imageRunner: ImageInferenceRunner? = null
     private var imageRunnerBackend: OnnxBackend? = null
     private var largeOnlineRunner: LargeOnlineCodecRunner? = null
+    private var pendingVideoUri: Uri? = null
+    private lateinit var videoStopButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -79,6 +84,12 @@ class MainActivity : Activity() {
         val largeMainButton = moduleButton("Large full\ncodec") {
             startTests(listOf("large_online_main"))
         }
+        val largeVideoButton = moduleButton("Large video\n1 min") {
+            openVideoPicker()
+        }
+        videoStopButton = moduleButton("Stop\nvideo") {
+            largeOnlineRunner?.cancelVideo()
+        }.apply { isEnabled = false }
         moduleButtons = buildList {
             addAll(
                 listOf(
@@ -98,6 +109,7 @@ class MainActivity : Activity() {
                 add(largeIpCodecButton)
                 add(largeIDecodeButton)
                 add(largeMainButton)
+                add(largeVideoButton)
             }
         }
 
@@ -149,6 +161,13 @@ class MainActivity : Activity() {
             addView(TextView(this@MainActivity).apply { text = "Large QP" })
             addView(largeQpSelector)
         }
+        val largeVideoControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(16, 0, 16, 0)
+            addView(largeVideoButton, buttonLayoutParams())
+            addView(videoStopButton, buttonLayoutParams())
+        }
         inputImage = comparisonImageView()
         reconImage = comparisonImageView()
         reconTitle = comparisonTitle("Reconstruction")
@@ -173,6 +192,7 @@ class MainActivity : Activity() {
             if (!isOnnxDemo) {
                 addView(largeQpControls)
                 addView(largeControls)
+                addView(largeVideoControls)
             }
             addView(
                 imageComparison,
@@ -214,6 +234,28 @@ class MainActivity : Activity() {
         }
     }
 
+    @Deprecated("Uses the platform document picker for broad Android compatibility")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != VIDEO_PICK_REQUEST || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val takeFlags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+        runCatching { contentResolver.takePersistableUriPermission(uri, takeFlags) }
+        pendingVideoUri = uri
+        startTests(listOf("large_offline_video"))
+    }
+
+    private fun openVideoPicker() {
+        startActivityForResult(
+            Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "video/*"
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            },
+            VIDEO_PICK_REQUEST,
+        )
+    }
+
     private fun requestedModules(intent: Intent): List<String> {
         val requested = when {
             intent.getBooleanExtra("temporalReferenceTest", false) -> listOf("temporal_reference")
@@ -245,6 +287,7 @@ class MainActivity : Activity() {
                 listOf("large_p_entropy_decode_speed")
             intent.getBooleanExtra("largePEntropyDecodeTest", false) -> listOf("large_p_entropy_decode")
             intent.getBooleanExtra("largeOnlineVideoTest", false) -> listOf("large_online_video")
+            intent.getBooleanExtra("largeOfflineVideoTest", false) -> listOf("large_offline_video")
             intent.getBooleanExtra("largeOnlineMainTest", false) -> listOf("large_online_main")
             intent.getBooleanExtra("ransCustomOpPartitionTest", false) -> listOf("rans_custom_op_partition")
             intent.getBooleanExtra("enterpriseTfliteTest", false) -> listOf("enterprise_tflite")
@@ -321,6 +364,7 @@ class MainActivity : Activity() {
         }
         running = true
         moduleButtons.forEach { it.isEnabled = false }
+        videoStopButton.isEnabled = requested.contains("large_offline_video")
         output.text = "GVC-RT clean deployment\n"
         imageComparison.visibility = View.GONE
         imageSummary.visibility = View.GONE
@@ -443,6 +487,22 @@ class MainActivity : Activity() {
                                 qp = fixedLargeQp(),
                             )
                         }
+                        moduleName == "large_offline_video" -> {
+                            val uri = pendingVideoUri
+                                ?: intent.getStringExtra("videoUri")?.let(Uri::parse)
+                                ?: intent.getStringExtra("videoPath")?.let { Uri.fromFile(File(it)) }
+                                ?: error("largeOfflineVideoTest requires videoUri/videoPath or a picked video")
+                            MemorySampler(this, ::emit).use { memory ->
+                                memory.begin("large_offline_video")
+                                largeOnlineRunner(::emit).runOfflineVideo(
+                                    inputUri = uri,
+                                    maxDurationSeconds = intent.getIntExtra("largeOfflineVideoSeconds", 60),
+                                    h264Bitrate = intent.getIntExtra("largeOfflineVideoBitrate", 8_000_000),
+                                    qp = fixedLargeQp(),
+                                )
+                                memory.mark("video_complete")
+                            }
+                        }
                         moduleName == "rans_custom_op_partition" -> {
                             TfliteCustomOpPartitionProbe(this, ::emit).run(
                                 warmupRuns = intent.getIntExtra("ransCustomOpWarmup", 3),
@@ -514,6 +574,7 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     running = false
                     moduleButtons.forEach { it.isEnabled = true }
+                    videoStopButton.isEnabled = false
                 }
             }
         }.start()
@@ -544,6 +605,21 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun showVideoComparison(input: Bitmap, reconstruction: Bitmap, psnr: Double, frame: Int) {
+        runOnUiThread {
+            val oldInput = (inputImage.drawable as? BitmapDrawable)?.bitmap
+            val oldReconstruction = (reconImage.drawable as? BitmapDrawable)?.bitmap
+            inputImage.setImageBitmap(input)
+            reconImage.setImageBitmap(reconstruction)
+            if (oldInput !== input && oldInput?.isRecycled == false) oldInput.recycle()
+            if (oldReconstruction !== reconstruction && oldReconstruction?.isRecycled == false) {
+                oldReconstruction.recycle()
+            }
+            reconTitle.text = "Frame $frame PSNR ${String.format(Locale.US, "%.2f", psnr)} dB"
+            imageComparison.visibility = View.VISIBLE
+        }
+    }
+
     private fun updateImageSummary(line: String) {
         when {
             line.startsWith("image_inference_source=") -> {
@@ -565,6 +641,18 @@ class MainActivity : Activity() {
             line.startsWith("image_speed stage=decode_core") -> {
                 imageSummaryLines["Decode"] = "Decode core: ${line.valueAfter("ms")} ms"
             }
+            line.startsWith("large_offline_video_progress phase=decode") -> {
+                imageSummaryLines["VideoProgress"] =
+                    "Video: frame ${line.valueAfter("frame")}, PSNR ${line.valueAfter("psnr_db")} dB"
+            }
+            line.startsWith("large_offline_video_speed phase=gvc_model_total") -> {
+                imageSummaryLines["VideoSpeed"] =
+                    "GVC model: ${line.valueAfter("mean_frame_ms")} ms/frame, ${line.valueAfter("fps")} fps"
+            }
+            line.startsWith("large_offline_video_quality") -> {
+                imageSummaryLines["VideoQuality"] =
+                    "Mean PSNR: ${line.valueAfter("mean_psnr_db")} dB"
+            }
         }
         if (imageSummaryLines.isNotEmpty()) {
             imageSummary.text = imageSummaryLines.values.joinToString("\n")
@@ -573,7 +661,7 @@ class MainActivity : Activity() {
     }
 
     private fun largeOnlineRunner(emit: (String) -> Unit): LargeOnlineCodecRunner =
-        largeOnlineRunner ?: LargeOnlineCodecRunner(this, emit, ::showImageComparison).also {
+        largeOnlineRunner ?: LargeOnlineCodecRunner(this, emit, ::showImageComparison, ::showVideoComparison).also {
             largeOnlineRunner = it
         }
 
@@ -606,6 +694,7 @@ class MainActivity : Activity() {
     companion object {
         const val TAG = "GVC_RT_CLEAN"
         private const val FIXED_LARGE_QP = 9
+        private const val VIDEO_PICK_REQUEST = 4109
         private val ONNX_DEMO_MODULES = setOf(
             "temporal_reference",
             "complete_encoder",

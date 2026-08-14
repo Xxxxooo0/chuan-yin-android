@@ -3,13 +3,18 @@ package com.gvcrt.clean
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.net.Uri
 import android.os.SystemClock
 import com.mediatek.neuropilot_V.neuron.NeuronDelegate
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CancellationException
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.log10
 import kotlin.math.sqrt
 
@@ -18,8 +23,10 @@ class LargeOnlineCodecRunner(
     private val context: Context,
     private val emit: (String) -> Unit,
     private val showImages: ((File, File, Double) -> Unit)? = null,
+    private val showVideoFrames: ((Bitmap, Bitmap, Double, Int) -> Unit)? = null,
 ) : AutoCloseable {
     private var prepared: PreparedRuntimes? = null
+    private val videoCancelled = AtomicBoolean(false)
 
     fun run(imagePath: String?, warmupRuns: Int = 1, measuredRuns: Int = 1, qp: Int = DEFAULT_QP) {
         val image = ImageTensorLoader.load(context, imagePath)
@@ -63,6 +70,129 @@ class LargeOnlineCodecRunner(
             dumpPEntropyBoundaries = dumpPEntropyBoundaries,
             qp = qp,
         )
+    }
+
+    fun cancelVideo() {
+        videoCancelled.set(true)
+    }
+
+    /** Runs a bounded-memory two-pass video test: GVC encode/mux, then independent demux/decode/MP4. */
+    fun runOfflineVideo(
+        inputUri: Uri,
+        maxDurationSeconds: Int = 60,
+        h264Bitrate: Int = 8_000_000,
+        qp: Int = DEFAULT_QP,
+    ) {
+        require(maxDurationSeconds > 0)
+        videoCancelled.set(false)
+        val runtimes = prepare(qp)
+        val pipelineStarted = SystemClock.elapsedRealtimeNanos()
+        val outputRoot = context.getExternalFilesDir(null)!!
+            .resolve("enterprise_tflite_codec/large/video_demo/${timestamp()}")
+            .apply { mkdirs() }
+        val streamFile = outputRoot.resolve("encoded_video.gvc")
+        val mp4File = outputRoot.resolve("reconstructed.mp4")
+        val maxDurationUs = maxDurationSeconds * 1_000_000L
+        emit(
+            "large_offline_video_start uri=$inputUri max_seconds=$maxDurationSeconds qp=${runtimes.stream.qp} " +
+                "model=${WIDTH}x$HEIGHT h264_bitrate=$h264Bitrate audio=false mode=two_pass_streaming",
+        )
+        try {
+            val encodeResult: VideoEncodeResult
+            val videoInfo: OfflineVideoInfo
+            OfflineVideoFrameReader(context, inputUri, WIDTH, HEIGHT, maxDurationUs).use { reader ->
+                videoInfo = reader.info
+                emit(
+                    "large_offline_video_source width=${videoInfo.width} height=${videoInfo.height} " +
+                        "rotation=${videoInfo.rotationDegrees} fps=${videoInfo.frameRate} " +
+                        "duration_ms=${format(videoInfo.durationUs / 1000.0)} mime=${videoInfo.mime}",
+                )
+                encodeResult = encodeVideo(reader, runtimes)
+            }
+            require(encodeResult.payloads.isNotEmpty()) { "video decoder produced no frames" }
+            val muxStarted = SystemClock.elapsedRealtimeNanos()
+            val stream = GvcStreamMuxer.muxSequence(runtimes.stream, encodeResult.payloads)
+            val muxNs = elapsedNs(muxStarted)
+            streamFile.writeBytes(stream)
+            val parsed = GvcStreamMuxer.demuxSequence(stream)
+            require(parsed.frames.size == encodeResult.payloads.size)
+
+            val decodeResult: VideoDecodeResult
+            OfflineVideoFrameReader(context, inputUri, WIDTH, HEIGHT, maxDurationUs).use { reader ->
+                ReconstructionMp4Writer(
+                    output = mp4File,
+                    width = WIDTH,
+                    height = HEIGHT,
+                    frameRate = videoInfo.frameRate,
+                    bitrate = h264Bitrate,
+                ).use { writer ->
+                    decodeResult = decodeVideo(
+                        reader = reader,
+                        frames = parsed.frames,
+                        expectedReconstructionHashes = encodeResult.reconstructionHashes,
+                        expectedPresentationTimesUs = encodeResult.presentationTimesUs,
+                        runtimes = runtimes,
+                        writer = writer,
+                    )
+                }
+            }
+
+            val encodeModelNs = encodeResult.timings.values.sum()
+            val decodeModelNs = decodeResult.timings.values.sum()
+            emitVideoTimings("encode", encodeResult.timings, encodeResult.payloads.size)
+            emitVideoTimings("decode", decodeResult.timings, parsed.frames.size)
+            emit(
+                "large_offline_video_speed phase=gvc_model_total frames=${parsed.frames.size} " +
+                    "encode_ms=${format(encodeModelNs / 1_000_000.0)} " +
+                    "decode_ms=${format(decodeModelNs / 1_000_000.0)} " +
+                    "mean_frame_ms=${format((encodeModelNs + decodeModelNs) / parsed.frames.size / 1_000_000.0)} " +
+                    "fps=${format(parsed.frames.size * 1_000_000_000.0 / (encodeModelNs + decodeModelNs))} " +
+                    "includes_source_decode=false includes_mp4=false includes_create=false",
+            )
+
+            val inputPng = writeNhwcPng(decodeResult.lastInput, outputRoot.resolve("input_last.png"))
+            val reconPng = writeNhwcPng(decodeResult.lastReconstruction, outputRoot.resolve("reconstructed_last.png"))
+            showImages?.invoke(inputPng, reconPng, decodeResult.psnrs.last())
+            val pipelineWallNs = elapsedNs(pipelineStarted)
+            val report = JSONObject().apply {
+                put("input_uri", inputUri.toString())
+                put("qp", runtimes.stream.qp)
+                put("frame_count", parsed.frames.size)
+                put("source_width", videoInfo.width)
+                put("source_height", videoInfo.height)
+                put("source_frame_rate", videoInfo.frameRate)
+                put("source_decode_encode_pass_ms", encodeResult.sourceDecodeNs / 1_000_000.0)
+                put("source_decode_compare_pass_ms", decodeResult.sourceDecodeNs / 1_000_000.0)
+                put("gvc_encode_model_ms", encodeModelNs / 1_000_000.0)
+                put("gvc_decode_model_ms", decodeModelNs / 1_000_000.0)
+                put("stream_mux_ms", muxNs / 1_000_000.0)
+                put("mp4_write_ms", decodeResult.mp4WriteNs / 1_000_000.0)
+                put("pipeline_wall_ms_excluding_model_create", pipelineWallNs / 1_000_000.0)
+                put("mean_psnr_db", decodeResult.psnrs.average())
+                put("min_psnr_db", decodeResult.psnrs.minOrNull())
+                put("final_psnr_db", decodeResult.psnrs.last())
+                put("gvc_bytes", stream.size)
+                put("gvc_sha256", sha256(stream))
+                put("gvc_path", streamFile.absolutePath)
+                put("reconstructed_mp4_path", mp4File.absolutePath)
+            }
+            outputRoot.resolve("run_report.json").writeText(report.toString(2))
+            emit(
+                "large_offline_video_quality frames=${parsed.frames.size} " +
+                    "mean_psnr_db=${format(decodeResult.psnrs.average())} " +
+                    "min_psnr_db=${format(decodeResult.psnrs.minOrNull()!!)} " +
+                    "final_psnr_db=${format(decodeResult.psnrs.last())} domain=model_tensor_before_h264",
+            )
+            emit(
+                "large_offline_video_output gvc=${streamFile.absolutePath} gvc_bytes=${stream.size} " +
+                    "gvc_sha256=${sha256(stream)} mp4=${mp4File.absolutePath} " +
+                    "pipeline_wall_ms=${format(pipelineWallNs / 1_000_000.0)} " +
+                    "report=${outputRoot.resolve("run_report.json").absolutePath}",
+            )
+            emit("large_offline_video_complete status=PASS")
+        } catch (_: CancellationException) {
+            emit("large_offline_video_complete status=CANCELLED output=${outputRoot.absolutePath}")
+        }
     }
 
     private fun runSequenceFiles(
@@ -219,6 +349,229 @@ class LargeOnlineCodecRunner(
         )
         emit("large_online_main_complete status=PASS all_models_exercised=true")
     }
+
+    private fun encodeVideo(reader: OfflineVideoFrameReader, runtimes: PreparedRuntimes): VideoEncodeResult {
+        val payloads = ArrayList<GvcFramePayload>()
+        val hashes = ArrayList<String>()
+        val presentationTimes = ArrayList<Long>()
+        val timings = linkedMapOf<String, Long>()
+        var sourceDecodeNs = 0L
+        var firstPtsUs: Long? = null
+        var encoderReferenceFrame: ByteArray? = null
+        var encoderReferenceFeature: ByteArray? = null
+
+        fun <T> timed(name: String, block: () -> T): T {
+            val started = SystemClock.elapsedRealtimeNanos()
+            return block().also { timings[name] = (timings[name] ?: 0L) + elapsedNs(started) }
+        }
+
+        while (true) {
+            throwIfVideoCancelled()
+            val readStarted = SystemClock.elapsedRealtimeNanos()
+            val frame = reader.next()
+            sourceDecodeNs += elapsedNs(readStarted)
+            if (frame == null) break
+            val index = payloads.size
+            if (firstPtsUs == null) firstPtsUs = frame.presentationTimeUs
+            presentationTimes += (frame.presentationTimeUs - firstPtsUs!!).coerceAtLeast(0)
+            if (index == 0) {
+                val y = timed("i_encoder") {
+                    runtimes.iEncoder.run(runtimes.neuralInputs(listOf(frame.tensor), "i_q_enc")).single()
+                }
+                val entropy = timed("i_entropy_rans") {
+                    runtimes.iEntropyEncoder.runCanonical(y, qp = runtimes.stream.qp)
+                }
+                require(entropy.size == 2)
+                val reconstruction = timed("i_decoder_reference") {
+                    runtimes.iDecoder.run(
+                        runtimes.neuralInputs(listOf(entropy[0]), "i_q_dec", "i_q_recon"),
+                    ).single()
+                }
+                payloads += GvcFramePayload(true, entropy[1])
+                hashes += sha256(reconstruction)
+                encoderReferenceFrame = reconstruction
+            } else {
+                val resetReference = shouldResetReference(index)
+                val temporal = timed(if (resetReference) "p_temporal_from_frame" else "p_temporal_from_feature") {
+                    if (resetReference) {
+                        runtimes.temporalFromFrame.run(
+                            runtimes.neuralInputs(
+                                listOf(encoderReferenceFrame ?: error("missing encoder frame reference")),
+                                "p_q_feature",
+                            ),
+                        )
+                    } else {
+                        runtimes.temporalFromFeature.run(
+                            runtimes.neuralInputs(
+                                listOf(encoderReferenceFeature ?: error("missing encoder feature reference")),
+                                "p_q_feature",
+                            ),
+                        )
+                    }
+                }
+                require(temporal.size == 3)
+                val ctx = temporal[1]
+                val ctxT = temporal[2]
+                val y = timed("p_encoder") {
+                    runtimes.pEncoder.run(runtimes.neuralInputs(listOf(frame.tensor, ctx), "p_q_enc")).single()
+                }
+                val entropy = timed("p_entropy_rans") {
+                    runtimes.pEntropyEncoder.runCanonical(y, ctxT, qp = runtimes.stream.qp)
+                }
+                require(entropy.size == 2)
+                val reconstruction = timed("p_decoder_reference") {
+                    runtimes.pDecoder.run(
+                        runtimes.neuralInputs(listOf(entropy[0], ctx), "p_q_dec", "p_q_recon"),
+                    )
+                }
+                require(reconstruction.size == 2)
+                payloads += GvcFramePayload(false, entropy[1])
+                encoderReferenceFeature = reconstruction[0]
+                encoderReferenceFrame = reconstruction[1]
+                hashes += sha256(reconstruction[1])
+            }
+            if (index == 0 || (index + 1) % VIDEO_PROGRESS_INTERVAL == 0) {
+                emit(
+                    "large_offline_video_progress phase=encode frame=${index + 1} " +
+                        "pts_ms=${format(presentationTimes.last() / 1000.0)} payload_bytes=${payloads.last().payload.size}",
+                )
+            }
+        }
+        return VideoEncodeResult(payloads, hashes, presentationTimes, timings, sourceDecodeNs)
+    }
+
+    private fun decodeVideo(
+        reader: OfflineVideoFrameReader,
+        frames: List<GvcFramePayload>,
+        expectedReconstructionHashes: List<String>,
+        expectedPresentationTimesUs: List<Long>,
+        runtimes: PreparedRuntimes,
+        writer: ReconstructionMp4Writer,
+    ): VideoDecodeResult {
+        require(frames.size == expectedReconstructionHashes.size && frames.size == expectedPresentationTimesUs.size)
+        val timings = linkedMapOf<String, Long>()
+        val psnrs = ArrayList<Double>(frames.size)
+        var sourceDecodeNs = 0L
+        var mp4WriteNs = 0L
+        var decoderReferenceFrame: ByteArray? = null
+        var decoderReferenceFeature: ByteArray? = null
+        var lastInput: ByteArray? = null
+        var lastReconstruction: ByteArray? = null
+
+        fun <T> timed(name: String, block: () -> T): T {
+            val started = SystemClock.elapsedRealtimeNanos()
+            return block().also { timings[name] = (timings[name] ?: 0L) + elapsedNs(started) }
+        }
+
+        frames.forEachIndexed { index, payload ->
+            throwIfVideoCancelled()
+            val readStarted = SystemClock.elapsedRealtimeNanos()
+            val sourceFrame = reader.next() ?: error("source video ended before GVC frame=$index")
+            sourceDecodeNs += elapsedNs(readStarted)
+            val reconstruction: ByteArray
+            if (payload.isIFrame) {
+                require(index == 0)
+                val yHat = timed("i_entropy_rans") {
+                    runtimes.iEntropyDecoder.runCanonical(payload.payload, qp = runtimes.stream.qp)
+                }
+                reconstruction = timed("i_decoder") {
+                    runtimes.iDecoder.run(
+                        runtimes.neuralInputs(listOf(yHat), "i_q_dec", "i_q_recon"),
+                    ).single()
+                }
+                decoderReferenceFrame = reconstruction
+            } else {
+                val resetReference = shouldResetReference(index)
+                val temporal = timed(if (resetReference) "p_temporal_from_frame" else "p_temporal_from_feature") {
+                    if (resetReference) {
+                        runtimes.temporalFromFrame.run(
+                            runtimes.neuralInputs(
+                                listOf(decoderReferenceFrame ?: error("missing decoder frame reference")),
+                                "p_q_feature",
+                            ),
+                        )
+                    } else {
+                        runtimes.temporalFromFeature.run(
+                            runtimes.neuralInputs(
+                                listOf(decoderReferenceFeature ?: error("missing decoder feature reference")),
+                                "p_q_feature",
+                            ),
+                        )
+                    }
+                }
+                require(temporal.size == 3)
+                val ctx = temporal[1]
+                val ctxT = temporal[2]
+                val yHat = timed("p_entropy_rans") {
+                    runtimes.pEntropyDecoder.runCanonical(payload.payload, ctxT, qp = runtimes.stream.qp)
+                }
+                val outputs = timed("p_decoder") {
+                    runtimes.pDecoder.run(
+                        runtimes.neuralInputs(listOf(yHat, ctx), "p_q_dec", "p_q_recon"),
+                    )
+                }
+                require(outputs.size == 2)
+                decoderReferenceFeature = outputs[0]
+                decoderReferenceFrame = outputs[1]
+                reconstruction = outputs[1]
+            }
+            require(sha256(reconstruction) == expectedReconstructionHashes[index]) {
+                "encoder/independent-decoder reconstruction mismatch at video frame=$index"
+            }
+            val psnr = calculatePsnr(sourceFrame.tensor, reconstruction)
+            psnrs += psnr
+            val writeStarted = SystemClock.elapsedRealtimeNanos()
+            writer.writeFrame(reconstruction, expectedPresentationTimesUs[index])
+            mp4WriteNs += elapsedNs(writeStarted)
+            lastInput = sourceFrame.tensor
+            lastReconstruction = reconstruction
+            if (showVideoFrames != null && (index == 0 || (index + 1) % VIDEO_PREVIEW_INTERVAL == 0 || index == frames.lastIndex)) {
+                showVideoFrames.invoke(
+                    VideoTensorCodec.toBitmap(sourceFrame.tensor, WIDTH, HEIGHT),
+                    VideoTensorCodec.toBitmap(reconstruction, WIDTH, HEIGHT),
+                    psnr,
+                    index + 1,
+                )
+            }
+            if (index == 0 || (index + 1) % VIDEO_PROGRESS_INTERVAL == 0 || index == frames.lastIndex) {
+                emit(
+                    "large_offline_video_progress phase=decode frame=${index + 1}/${frames.size} " +
+                        "pts_ms=${format(expectedPresentationTimesUs[index] / 1000.0)} psnr_db=${format(psnr)}",
+                )
+            }
+        }
+        return VideoDecodeResult(
+            timings = timings,
+            psnrs = psnrs,
+            sourceDecodeNs = sourceDecodeNs,
+            mp4WriteNs = mp4WriteNs,
+            lastInput = lastInput ?: error("missing final input frame"),
+            lastReconstruction = lastReconstruction ?: error("missing final reconstruction"),
+        )
+    }
+
+    private fun emitVideoTimings(phase: String, timings: Map<String, Long>, frameCount: Int) {
+        timings.forEach { (stage, elapsed) ->
+            emit(
+                "large_offline_video_speed phase=$phase stage=$stage total_ms=${format(elapsed / 1_000_000.0)} " +
+                    "per_sequence_frame_ms=${format(elapsed / frameCount / 1_000_000.0)} includes_create=false",
+            )
+        }
+    }
+
+    private fun throwIfVideoCancelled() {
+        if (videoCancelled.get()) throw CancellationException("video test cancelled")
+    }
+
+    private fun writeNhwcPng(bytes: ByteArray, output: File): File {
+        val bitmap = VideoTensorCodec.toBitmap(bytes, WIDTH, HEIGHT)
+        output.parentFile?.mkdirs()
+        output.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        bitmap.recycle()
+        return output
+    }
+
+    private fun timestamp(): String = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
 
     private fun execute(
         inputCount: Int,
@@ -660,6 +1013,23 @@ class LargeOnlineCodecRunner(
         val lastDecoded: ByteArray,
     )
 
+    private data class VideoEncodeResult(
+        val payloads: List<GvcFramePayload>,
+        val reconstructionHashes: List<String>,
+        val presentationTimesUs: List<Long>,
+        val timings: Map<String, Long>,
+        val sourceDecodeNs: Long,
+    )
+
+    private data class VideoDecodeResult(
+        val timings: Map<String, Long>,
+        val psnrs: List<Double>,
+        val sourceDecodeNs: Long,
+        val mp4WriteNs: Long,
+        val lastInput: ByteArray,
+        val lastReconstruction: ByteArray,
+    )
+
     private data class PreparedRuntimes(
         var stream: StreamSpec,
         val temporalFromFrame: OfficialNeuronRuntime,
@@ -719,6 +1089,8 @@ class LargeOnlineCodecRunner(
         const val DEFAULT_FRAME_COUNT = 3
         const val REFERENCE_RESET_INTERVAL = 32
         const val P_ENTROPY_LOG_INTERVAL = 16
+        const val VIDEO_PROGRESS_INTERVAL = 24
+        const val VIDEO_PREVIEW_INTERVAL = 8
         const val I_ENTROPY_ENCODER = "i_entropy_prior_merged_rans.tflite"
         const val P_ENTROPY_ENCODER = "p_entropy_prior_merged_rans.tflite"
         const val I_ENTROPY_DECODER = "i_entropy_decode_merged_rans.tflite"
