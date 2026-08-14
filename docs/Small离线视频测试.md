@@ -1,10 +1,13 @@
 # Small 离线视频测试
 
-该入口把普通视频逐帧缩放为固定 `256x512`、数值范围 `[0,1]` 的 NHWC FP32 张量，并按 Small 模型真实顺序执行：
+该入口把普通视频逐帧转换为固定 `256x512`、数值范围 `[0,1]` 的 NHWC FP32
+YCbCr444 张量。全序列固定使用 QP index 9，并按源码的参考重置规则执行：
 
 ```text
-上一帧 reference_feature（首帧全零）
-  -> temporal_reference.tflite
+第 0 帧及 frame_index % 64 == 1：上一重建 reference_frame
+  -> temporal_from_frame.tflite
+其他帧：上一帧 reference_feature
+  -> temporal_from_feature.tflite
 当前帧 + ctx
   -> encoder.tflite
 latent_y + ctx + memory
@@ -12,7 +15,10 @@ latent_y + ctx + memory
   -> reconstructed_frame + 下一帧 reference_feature
 ```
 
-三张 TFLite 均使用官方 MediaTek `NeuronDelegate`，配置与已验证的 Small 精度/速度探针一致：`mtk-neuron`、`--relax-fp32`、允许 FP16 计算、`FAST_SINGLE_ANSWER`。该路径不生成压缩码流；输出 MP4 仅用于观看重建结果。
+四张 TFLite 均使用官方 MediaTek `NeuronDelegate`，配置为 `mtk-neuron`、
+`--relax-fp32`、允许 FP16 计算、`FAST_SINGLE_ANSWER`。首个 reference frame 为全
+0.5；Decoder 输出的 reference frame 和 reference feature 都会保留。该路径不生成
+压缩码流；输出 MP4 仅用于观看重建结果。
 
 ## App 操作
 
@@ -41,4 +47,5 @@ adb logcat -d -s GVC_RT_CLEAN:I
 - `reconstructed_last.png`
 - `run_report.json`
 
-PSNR 在 H.264 写出之前按模型 FP32 张量计算；模型耗时不包含视频解码、MP4 写入和模型创建。
+PSNR 在 H.264 写出之前，将模型 YCbCr444 输入输出转换到 BT.709 RGB 后计算；
+模型耗时不包含视频解码、MP4 写入和模型创建。

@@ -54,11 +54,12 @@ internal class SmallOfflineVideoRunner(
         emit(
             "small_offline_video_start uri=$inputUri max_seconds=$maxDurationSeconds " +
                 "model=${WIDTH}x$HEIGHT h264_bitrate=$h264Bitrate audio=false " +
-                "mode=single_pass_reference_feature backend=official_aar_neuron " +
-                "runtime_profile=mlvc_relax_fp32",
+                "mode=fixed_qp9_reference_reset backend=official_aar_neuron " +
+                "runtime_profile=gvc_rt_small_relax_fp32 tensor_color=ycbcr_bt709",
         )
         try {
             var referenceFeature = ByteArray(REFERENCE_FEATURE_BYTES)
+            var referenceFrame = neutralReferenceFrame()
             val temporalTimes = mutableListOf<Long>()
             val encoderTimes = mutableListOf<Long>()
             val decoderTimes = mutableListOf<Long>()
@@ -79,6 +80,7 @@ internal class SmallOfflineVideoRunner(
                 targetHeight = HEIGHT,
                 maxDurationUs = maxDurationSeconds * 1_000_000L,
                 tensorRange = VideoTensorRange.ZERO_TO_ONE,
+                tensorColorSpace = VideoTensorColorSpace.YCBCR_BT709,
             ).use { reader ->
                 videoInfo = reader.info
                 emit(
@@ -93,6 +95,7 @@ internal class SmallOfflineVideoRunner(
                     frameRate = videoInfo.frameRate,
                     bitrate = h264Bitrate,
                     tensorRange = VideoTensorRange.ZERO_TO_ONE,
+                    tensorColorSpace = VideoTensorColorSpace.YCBCR_BT709,
                 ).use { writer ->
                     while (true) {
                         checkNotCancelled()
@@ -104,7 +107,12 @@ internal class SmallOfflineVideoRunner(
 
                         val modelStarted = SystemClock.elapsedRealtimeNanos()
                         val temporalStarted = SystemClock.elapsedRealtimeNanos()
-                        val temporalOutputs = runtimes.temporal.run(listOf(referenceFeature))
+                        val resetFromFrame = frameCount == 0 || frameCount % REFERENCE_RESET_PERIOD == 1
+                        val temporalOutputs = if (resetFromFrame) {
+                            runtimes.temporalFromFrame.run(listOf(referenceFrame))
+                        } else {
+                            runtimes.temporalFromFeature.run(listOf(referenceFeature))
+                        }
                         temporalTimes += elapsedNs(temporalStarted)
                         require(temporalOutputs.size == 3) {
                             "small temporal output count=${temporalOutputs.size}"
@@ -128,6 +136,7 @@ internal class SmallOfflineVideoRunner(
                         modelTotalTimes += elapsedNs(modelStarted)
                         referenceFeature = decoderOutputs[0]
                         val reconstruction = decoderOutputs[1]
+                        referenceFrame = reconstruction
                         val psnr = calculatePsnr(sourceFrame.tensor, reconstruction)
                         psnrs += psnr
 
@@ -146,6 +155,9 @@ internal class SmallOfflineVideoRunner(
                                     "pts_ms=${format((sourceFrame.presentationTimeUs - (firstPtsUs ?: 0L)) / 1000.0)} " +
                                     "psnr_db=${format(psnr)} model_ms=${format(modelTotalTimes.last() / 1_000_000.0)}",
                             )
+                        }
+                        if (resetFromFrame) {
+                            emit("small_offline_video_reference_reset frame_index=${frameCount - 1} source=reference_frame qp=9")
                         }
                     }
                 }
@@ -198,8 +210,12 @@ internal class SmallOfflineVideoRunner(
                 put("mean_psnr_db", psnrs.average())
                 put("min_psnr_db", psnrs.minOrNull())
                 put("final_psnr_db", psnrs.last())
-                put("psnr_domain", "model_tensor_0_1_before_h264")
-                put("reference_initialization", "zero_feature")
+                put("model_tensor_color", "ycbcr_bt709_444_0_1")
+                put("psnr_domain", "rgb_bt709_from_model_ycbcr444_before_h264")
+                put("fixed_q_index", 9)
+                put("reference_initialization", "neutral_frame_0_5")
+                put("reference_reset_period", REFERENCE_RESET_PERIOD)
+                put("reference_reset_phase", 1)
                 put("reconstructed_mp4_path", mp4File.absolutePath)
                 put("reconstructed_mp4_sha256", sha256(mp4File))
             }
@@ -207,7 +223,7 @@ internal class SmallOfflineVideoRunner(
             emit(
                 "small_offline_video_quality frames=$frameCount mean_psnr_db=${format(psnrs.average())} " +
                     "min_psnr_db=${format(psnrs.minOrNull()!!)} final_psnr_db=${format(psnrs.last())} " +
-                    "domain=model_tensor_0_1_before_h264",
+                    "domain=rgb_bt709_from_model_ycbcr444_before_h264",
             )
             emit(
                 "small_offline_video_output mp4=${mp4File.absolutePath} mp4_bytes=${mp4File.length()} " +
@@ -236,7 +252,7 @@ internal class SmallOfflineVideoRunner(
             )
             return OfficialNeuronRuntime.create(
                 tfliteFile = modelFile,
-                cacheDir = context.cacheDir.resolve("enterprise_tflite/small/mlvc_relax_fp32/$modelName"),
+                cacheDir = context.cacheDir.resolve("enterprise_tflite/small/gvc_rt_small_relax_fp32/$modelName"),
                 allowFp16ForFp32 = true,
                 acceleratorName = "mtk-neuron",
                 compileOptions = "--relax-fp32",
@@ -252,25 +268,39 @@ internal class SmallOfflineVideoRunner(
             }
         }
 
-        val temporal = create("temporal_reference")
+        val temporalFromFrame = create("temporal_from_frame")
+        val temporalFromFeature = try {
+            create("temporal_from_feature")
+        } catch (error: Throwable) {
+            temporalFromFrame.close()
+            throw error
+        }
         val encoder = try {
             create("encoder")
         } catch (error: Throwable) {
-            temporal.close()
+            temporalFromFeature.close()
+            temporalFromFrame.close()
             throw error
         }
         val decoder = try {
             create("decoder")
         } catch (error: Throwable) {
             encoder.close()
-            temporal.close()
+            temporalFromFeature.close()
+            temporalFromFrame.close()
             throw error
         }
-        return SmallRuntimes(temporal, encoder, decoder).also { runtimes ->
+        return SmallRuntimes(temporalFromFrame, temporalFromFeature, encoder, decoder).also { runtimes ->
             try {
-                require(temporal.inputSizes.contentEquals(longArrayOf(REFERENCE_FEATURE_BYTES.toLong())))
+                require(temporalFromFrame.inputSizes.contentEquals(longArrayOf(FRAME_BYTES.toLong())))
+                require(temporalFromFeature.inputSizes.contentEquals(longArrayOf(REFERENCE_FEATURE_BYTES.toLong())))
                 require(
-                    temporal.outputSizes.contentEquals(
+                    temporalFromFrame.outputSizes.contentEquals(
+                        longArrayOf(CTX_BYTES.toLong(), CTX_BYTES.toLong(), MEMORY_BYTES.toLong()),
+                    ),
+                )
+                require(
+                    temporalFromFeature.outputSizes.contentEquals(
                         longArrayOf(CTX_BYTES.toLong(), CTX_BYTES.toLong(), MEMORY_BYTES.toLong()),
                     ),
                 )
@@ -297,10 +327,17 @@ internal class SmallOfflineVideoRunner(
         val internalRoot = context.filesDir.resolve("enterprise_tflite/small")
         val externalRoot = context.getExternalFilesDir(null)?.resolve("enterprise_tflite/small")
         return listOfNotNull(internalRoot, externalRoot).firstOrNull { root ->
-            root.resolve("input_manifest.json").isFile &&
-                listOf("temporal_reference", "encoder", "decoder").all { root.resolve("models/$it.tflite").isFile }
+            root.resolve("manifest.json").isFile &&
+                listOf("temporal_from_frame", "temporal_from_feature", "encoder", "decoder")
+                    .all { root.resolve("models/$it.tflite").isFile }
         } ?: error("Small TFLite package is not installed under ${internalRoot.absolutePath}")
     }
+
+    private fun neutralReferenceFrame(): ByteArray =
+        ByteArray(FRAME_BYTES).also { bytes ->
+            val values = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+            repeat(FRAME_BYTES / 4) { values.put(0.5f) }
+        }
 
     private fun emitTiming(stage: String, times: List<Long>) {
         val sorted = times.sorted()
@@ -320,19 +357,41 @@ internal class SmallOfflineVideoRunner(
         val inputFloats = ByteBuffer.wrap(input).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
         val reconstructionFloats = ByteBuffer.wrap(reconstruction).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
         var sumSq = 0.0
-        repeat(input.size / 4) { index ->
-            val inputValue = inputFloats[index].coerceIn(0f, 1f).toDouble()
-            val reconstructionValue = reconstructionFloats[index].coerceIn(0f, 1f).toDouble()
-            val diff = reconstructionValue - inputValue
-            sumSq += diff * diff
+        val pixelCount = input.size / (3 * 4)
+        repeat(pixelCount) { pixel ->
+            val base = pixel * 3
+            val inputY = inputFloats[base].coerceIn(0f, 1f).toDouble()
+            val inputCb = inputFloats[base + 1].coerceIn(0f, 1f).toDouble()
+            val inputCr = inputFloats[base + 2].coerceIn(0f, 1f).toDouble()
+            val reconY = reconstructionFloats[base].coerceIn(0f, 1f).toDouble()
+            val reconCb = reconstructionFloats[base + 1].coerceIn(0f, 1f).toDouble()
+            val reconCr = reconstructionFloats[base + 2].coerceIn(0f, 1f).toDouble()
+
+            val inputR = (inputY + 1.5748 * (inputCr - 0.5)).coerceIn(0.0, 1.0)
+            val inputG = (inputY - 0.187324 * (inputCb - 0.5) - 0.468124 * (inputCr - 0.5))
+                .coerceIn(0.0, 1.0)
+            val inputB = (inputY + 1.8556 * (inputCb - 0.5)).coerceIn(0.0, 1.0)
+            val reconR = (reconY + 1.5748 * (reconCr - 0.5)).coerceIn(0.0, 1.0)
+            val reconG = (reconY - 0.187324 * (reconCb - 0.5) - 0.468124 * (reconCr - 0.5))
+                .coerceIn(0.0, 1.0)
+            val reconB = (reconY + 1.8556 * (reconCb - 0.5)).coerceIn(0.0, 1.0)
+            sumSq += (reconR - inputR) * (reconR - inputR)
+            sumSq += (reconG - inputG) * (reconG - inputG)
+            sumSq += (reconB - inputB) * (reconB - inputB)
         }
-        val rmse = sqrt(sumSq / (input.size / 4))
+        val rmse = sqrt(sumSq / (pixelCount * 3))
         return if (rmse == 0.0) Double.POSITIVE_INFINITY else 20.0 * log10(1.0 / rmse)
     }
 
     private fun writePng(tensor: ByteArray, output: File): File {
         output.parentFile?.mkdirs()
-        val bitmap = VideoTensorCodec.toBitmap(tensor, WIDTH, HEIGHT, VideoTensorRange.ZERO_TO_ONE)
+        val bitmap = VideoTensorCodec.toBitmap(
+            tensor,
+            WIDTH,
+            HEIGHT,
+            VideoTensorRange.ZERO_TO_ONE,
+            VideoTensorColorSpace.YCBCR_BT709,
+        )
         output.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
         bitmap.recycle()
         return output
@@ -366,14 +425,16 @@ internal class SmallOfflineVideoRunner(
     }
 
     private data class SmallRuntimes(
-        val temporal: OfficialNeuronRuntime,
+        val temporalFromFrame: OfficialNeuronRuntime,
+        val temporalFromFeature: OfficialNeuronRuntime,
         val encoder: OfficialNeuronRuntime,
         val decoder: OfficialNeuronRuntime,
     ) : AutoCloseable {
         override fun close() {
             decoder.close()
             encoder.close()
-            temporal.close()
+            temporalFromFeature.close()
+            temporalFromFrame.close()
         }
     }
 
@@ -388,5 +449,6 @@ internal class SmallOfflineVideoRunner(
         const val MEMORY_BYTES = 32 * 64 * 48 * 4
         const val LATENT_BYTES = 16 * 32 * 48 * 4
         const val PROGRESS_INTERVAL = 10
+        const val REFERENCE_RESET_PERIOD = 64
     }
 }

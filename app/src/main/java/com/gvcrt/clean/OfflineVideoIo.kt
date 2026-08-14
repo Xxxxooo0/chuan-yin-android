@@ -37,7 +37,12 @@ internal enum class VideoTensorRange {
     NEGATIVE_ONE_TO_ONE,
 }
 
-/** Sequential MediaCodec reader that converts decoded YUV frames to fixed NHWC FP32 RGB. */
+internal enum class VideoTensorColorSpace {
+    RGB,
+    YCBCR_BT709,
+}
+
+/** Sequential MediaCodec reader that converts decoded YUV frames to fixed NHWC FP32 tensors. */
 internal class OfflineVideoFrameReader(
     context: Context,
     uri: Uri,
@@ -45,6 +50,7 @@ internal class OfflineVideoFrameReader(
     private val targetHeight: Int,
     private val maxDurationUs: Long,
     private val tensorRange: VideoTensorRange = VideoTensorRange.NEGATIVE_ONE_TO_ONE,
+    private val tensorColorSpace: VideoTensorColorSpace = VideoTensorColorSpace.RGB,
 ) : AutoCloseable {
     private val extractor = MediaExtractor()
     private val decoder: MediaCodec
@@ -116,6 +122,7 @@ internal class OfflineVideoFrameReader(
                                     targetHeight,
                                     info.rotationDegrees,
                                     tensorRange,
+                                    tensorColorSpace,
                                 ),
                             )
                         }
@@ -179,6 +186,7 @@ internal class ReconstructionMp4Writer(
     frameRate: Int,
     bitrate: Int,
     private val tensorRange: VideoTensorRange = VideoTensorRange.NEGATIVE_ONE_TO_ONE,
+    private val tensorColorSpace: VideoTensorColorSpace = VideoTensorColorSpace.RGB,
 ) : AutoCloseable {
     private val bufferInfo = MediaCodec.BufferInfo()
     private val encoder: MediaCodec
@@ -216,6 +224,7 @@ internal class ReconstructionMp4Writer(
             height,
             semiPlanar = colorFormat == COLOR_YUV420_SEMIPLANAR,
             tensorRange = tensorRange,
+            tensorColorSpace = tensorColorSpace,
         )
         while (true) {
             val inputIndex = encoder.dequeueInputBuffer(CODEC_TIMEOUT_US)
@@ -299,6 +308,7 @@ internal object VideoTensorCodec {
         targetHeight: Int,
         rotationDegrees: Int,
         tensorRange: VideoTensorRange = VideoTensorRange.NEGATIVE_ONE_TO_ONE,
+        tensorColorSpace: VideoTensorColorSpace = VideoTensorColorSpace.RGB,
     ): ByteArray {
         val crop = image.cropRect
         val sourceWidth = crop.width()
@@ -343,13 +353,19 @@ internal object VideoTensorCodec {
                     val y = sample(yPlane, sx, sy)
                     val u = sample(uPlane, sx / 2, sy / 2)
                     val v = sample(vPlane, sx / 2, sy / 2)
-                    val yf = (y - 16).coerceAtLeast(0) * 1.164f
-                    val r = (yf + 1.596f * (v - 128)).roundToInt().coerceIn(0, 255)
-                    val g = (yf - 0.392f * (u - 128) - 0.813f * (v - 128)).roundToInt().coerceIn(0, 255)
-                    val b = (yf + 2.017f * (u - 128)).roundToInt().coerceIn(0, 255)
-                    output.putFloat(normalizeByte(r, tensorRange))
-                    output.putFloat(normalizeByte(g, tensorRange))
-                    output.putFloat(normalizeByte(b, tensorRange))
+                    if (tensorColorSpace == VideoTensorColorSpace.YCBCR_BT709) {
+                        output.putFloat(normalizeByte(y, tensorRange))
+                        output.putFloat(normalizeByte(u, tensorRange))
+                        output.putFloat(normalizeByte(v, tensorRange))
+                    } else {
+                        val yf = (y - 16).coerceAtLeast(0) * 1.164f
+                        val r = (yf + 1.596f * (v - 128)).roundToInt().coerceIn(0, 255)
+                        val g = (yf - 0.392f * (u - 128) - 0.813f * (v - 128)).roundToInt().coerceIn(0, 255)
+                        val b = (yf + 2.017f * (u - 128)).roundToInt().coerceIn(0, 255)
+                        output.putFloat(normalizeByte(r, tensorRange))
+                        output.putFloat(normalizeByte(g, tensorRange))
+                        output.putFloat(normalizeByte(b, tensorRange))
+                    }
                 }
             }
         }
@@ -360,16 +376,28 @@ internal object VideoTensorCodec {
         width: Int,
         height: Int,
         tensorRange: VideoTensorRange = VideoTensorRange.NEGATIVE_ONE_TO_ONE,
+        tensorColorSpace: VideoTensorColorSpace = VideoTensorColorSpace.RGB,
     ): Bitmap {
         require(nhwcF32Le.size == width * height * 3 * 4)
         val values = ByteBuffer.wrap(nhwcF32Le).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
         val pixels = IntArray(width * height)
         for (index in pixels.indices) {
-            pixels[index] = Color.rgb(
-                displayByte(values[index * 3], tensorRange),
-                displayByte(values[index * 3 + 1], tensorRange),
-                displayByte(values[index * 3 + 2], tensorRange),
-            )
+            val base = index * 3
+            pixels[index] = if (tensorColorSpace == VideoTensorColorSpace.YCBCR_BT709) {
+                val y = displayUnit(values[base], tensorRange)
+                val cb = displayUnit(values[base + 1], tensorRange)
+                val cr = displayUnit(values[base + 2], tensorRange)
+                val r = y + 1.5748f * (cr - 0.5f)
+                val g = y - 0.187324f * (cb - 0.5f) - 0.468124f * (cr - 0.5f)
+                val b = y + 1.8556f * (cb - 0.5f)
+                Color.rgb(unitByte(r), unitByte(g), unitByte(b))
+            } else {
+                Color.rgb(
+                    displayByte(values[base], tensorRange),
+                    displayByte(values[base + 1], tensorRange),
+                    displayByte(values[base + 2], tensorRange),
+                )
+            }
         }
         return Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
             setPixels(pixels, 0, width, 0, 0, width, height)
@@ -382,17 +410,44 @@ internal object VideoTensorCodec {
         height: Int,
         semiPlanar: Boolean,
         tensorRange: VideoTensorRange = VideoTensorRange.NEGATIVE_ONE_TO_ONE,
+        tensorColorSpace: VideoTensorColorSpace = VideoTensorColorSpace.RGB,
     ): ByteArray {
         require(width % 2 == 0 && height % 2 == 0)
         require(nhwcF32Le.size == width * height * 3 * 4)
-        val rgb = ByteBuffer.wrap(nhwcF32Le).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+        val values = ByteBuffer.wrap(nhwcF32Le).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
         val plane = width * height
         val output = ByteArray(plane * 3 / 2)
+        if (tensorColorSpace == VideoTensorColorSpace.YCBCR_BT709) {
+            for (y in 0 until height) for (x in 0 until width) {
+                val base = (y * width + x) * 3
+                output[y * width + x] = displayByte(values[base], tensorRange).toByte()
+            }
+            for (y in 0 until height step 2) for (x in 0 until width step 2) {
+                var cb = 0f
+                var cr = 0f
+                for (yy in 0..1) for (xx in 0..1) {
+                    val base = ((y + yy) * width + x + xx) * 3
+                    cb += displayUnit(values[base + 1], tensorRange)
+                    cr += displayUnit(values[base + 2], tensorRange)
+                }
+                val chromaIndex = (y / 2) * (width / 2) + x / 2
+                val ub = unitByte(cb / 4f).toByte()
+                val vb = unitByte(cr / 4f).toByte()
+                if (semiPlanar) {
+                    output[plane + chromaIndex * 2] = ub
+                    output[plane + chromaIndex * 2 + 1] = vb
+                } else {
+                    output[plane + chromaIndex] = ub
+                    output[plane + plane / 4 + chromaIndex] = vb
+                }
+            }
+            return output
+        }
         for (y in 0 until height) for (x in 0 until width) {
             val base = (y * width + x) * 3
-            val r = displayByte(rgb[base], tensorRange).toFloat()
-            val g = displayByte(rgb[base + 1], tensorRange).toFloat()
-            val b = displayByte(rgb[base + 2], tensorRange).toFloat()
+            val r = displayByte(values[base], tensorRange).toFloat()
+            val g = displayByte(values[base + 1], tensorRange).toFloat()
+            val b = displayByte(values[base + 2], tensorRange).toFloat()
             output[y * width + x] = (16f + 0.257f * r + 0.504f * g + 0.098f * b)
                 .roundToInt().coerceIn(0, 255).toByte()
         }
@@ -401,9 +456,9 @@ internal object VideoTensorCodec {
             var v = 0f
             for (yy in 0..1) for (xx in 0..1) {
                 val base = ((y + yy) * width + x + xx) * 3
-                val r = displayByte(rgb[base], tensorRange).toFloat()
-                val g = displayByte(rgb[base + 1], tensorRange).toFloat()
-                val b = displayByte(rgb[base + 2], tensorRange).toFloat()
+                val r = displayByte(values[base], tensorRange).toFloat()
+                val g = displayByte(values[base + 1], tensorRange).toFloat()
+                val b = displayByte(values[base + 2], tensorRange).toFloat()
                 u += 128f - 0.148f * r - 0.291f * g + 0.439f * b
                 v += 128f + 0.439f * r - 0.368f * g - 0.071f * b
             }
@@ -433,9 +488,13 @@ internal object VideoTensorCodec {
         }
 
     private fun displayByte(value: Float, tensorRange: VideoTensorRange): Int =
+        unitByte(displayUnit(value, tensorRange))
+
+    private fun displayUnit(value: Float, tensorRange: VideoTensorRange): Float =
         when (tensorRange) {
-            VideoTensorRange.ZERO_TO_ONE -> (value.coerceIn(0f, 1f) * 255f).roundToInt()
-            VideoTensorRange.NEGATIVE_ONE_TO_ONE ->
-                (((value.coerceIn(-1f, 1f) + 1f) * 0.5f) * 255f).roundToInt()
-        }.coerceIn(0, 255)
+            VideoTensorRange.ZERO_TO_ONE -> value.coerceIn(0f, 1f)
+            VideoTensorRange.NEGATIVE_ONE_TO_ONE -> (value.coerceIn(-1f, 1f) + 1f) * 0.5f
+        }
+
+    private fun unitByte(value: Float): Int = (value.coerceIn(0f, 1f) * 255f).roundToInt()
 }
