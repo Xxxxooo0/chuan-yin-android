@@ -1,8 +1,0 @@
-{
-  "deployment_path": "mtk_offline",
-  "neural_runtime": "mediatek_offline_dla",
-  "model_root": "offline_models",
-  "codec_runtime": "native_rans",
-  "purpose": "production_deployment",
-  "status": "conversion_in_progress"
-}
