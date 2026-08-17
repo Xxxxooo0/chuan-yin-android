@@ -7,6 +7,7 @@ import android.graphics.drawable.BitmapDrawable
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.DocumentsContract
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -33,8 +34,9 @@ class MainActivity : Activity() {
     private var imageRunner: ImageInferenceRunner? = null
     private var imageRunnerBackend: OnnxBackend? = null
     private var largeOnlineRunner: LargeOnlineCodecRunner? = null
+    private var smallOnlineRunner: SmallOnlineSequenceRunner? = null
     private var pendingVideoUri: Uri? = null
-    private lateinit var videoStopButton: Button
+    private lateinit var variantSelector: Spinner
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,27 +71,9 @@ class MainActivity : Activity() {
         val imageInferenceButton = moduleButton("Image\ninfer") {
             startTests(listOf("image_inference"))
         }
-        val largeIPrecisionButton = moduleButton("Large I\nprecision") {
-            startTests(listOf("large_i_entropy_merged_precision"))
+        val sequenceTestButton = moduleButton("测试\n视频序列") {
+            openSequencePicker(selectedEnterpriseVariant())
         }
-        val largeISpeedButton = moduleButton("Large I\nspeed") {
-            startTests(listOf("large_i_entropy_merged_speed"))
-        }
-        val largeIpCodecButton = moduleButton("Large I/P\ncodec") {
-            startTests(listOf("large_i_entropy_codec", "large_p_entropy_codec"))
-        }
-        val largeIDecodeButton = moduleButton("Large I/P\ndecode") {
-            startTests(listOf("large_i_entropy_decode", "large_p_entropy_decode"))
-        }
-        val largeMainButton = moduleButton("Large full\ncodec") {
-            startTests(listOf("large_online_main"))
-        }
-        val largeVideoButton = moduleButton("Large video\n1 min") {
-            openVideoPicker()
-        }
-        videoStopButton = moduleButton("Stop\nvideo") {
-            largeOnlineRunner?.cancelVideo()
-        }.apply { isEnabled = false }
         moduleButtons = buildList {
             addAll(
                 listOf(
@@ -104,12 +88,7 @@ class MainActivity : Activity() {
                 )
             )
             if (!isOnnxDemo) {
-                add(largeIPrecisionButton)
-                add(largeISpeedButton)
-                add(largeIpCodecButton)
-                add(largeIDecodeButton)
-                add(largeMainButton)
-                add(largeVideoButton)
+                add(sequenceTestButton)
             }
         }
 
@@ -136,37 +115,20 @@ class MainActivity : Activity() {
             addView(fullProjectButton, buttonLayoutParams())
             addView(imageInferenceButton, buttonLayoutParams())
         }
-        val largeControls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(16, 0, 16, 0)
-            addView(largeIPrecisionButton, buttonLayoutParams())
-            addView(largeISpeedButton, buttonLayoutParams())
-            addView(largeIpCodecButton, buttonLayoutParams())
-            addView(largeIDecodeButton, buttonLayoutParams())
-            addView(largeMainButton, buttonLayoutParams())
-        }
-        val largeQpSelector = Spinner(this).apply {
+        variantSelector = Spinner(this).apply {
             adapter = ArrayAdapter(
                 this@MainActivity,
                 android.R.layout.simple_spinner_dropdown_item,
-                listOf("QP 9 (fixed)"),
+                listOf("Large", "Small"),
             )
-            isEnabled = false
         }
-        val largeQpControls = LinearLayout(this).apply {
+        val sequenceControls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             setPadding(16, 0, 16, 0)
-            addView(TextView(this@MainActivity).apply { text = "Large QP" })
-            addView(largeQpSelector)
-        }
-        val largeVideoControls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(16, 0, 16, 0)
-            addView(largeVideoButton, buttonLayoutParams())
-            addView(videoStopButton, buttonLayoutParams())
+            addView(TextView(this@MainActivity).apply { text = "模型" })
+            addView(variantSelector)
+            addView(sequenceTestButton, buttonLayoutParams())
         }
         inputImage = comparisonImageView()
         reconImage = comparisonImageView()
@@ -190,9 +152,7 @@ class MainActivity : Activity() {
             addView(speedControls)
             addView(projectControls)
             if (!isOnnxDemo) {
-                addView(largeQpControls)
-                addView(largeControls)
-                addView(largeVideoControls)
+                addView(sequenceControls)
             }
             addView(
                 imageComparison,
@@ -237,12 +197,17 @@ class MainActivity : Activity() {
     @Deprecated("Uses the platform document picker for broad Android compatibility")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != VIDEO_PICK_REQUEST || resultCode != RESULT_OK) return
+        if (resultCode != RESULT_OK) return
         val uri = data?.data ?: return
-        val takeFlags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
-        runCatching { contentResolver.takePersistableUriPermission(uri, takeFlags) }
-        pendingVideoUri = uri
-        startTests(listOf("large_offline_video"))
+        when (requestCode) {
+            VIDEO_PICK_REQUEST -> {
+                val takeFlags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+                runCatching { contentResolver.takePersistableUriPermission(uri, takeFlags) }
+                pendingVideoUri = uri
+                startTests(listOf("large_offline_video"))
+            }
+            SEQUENCE_PICK_REQUEST -> stageSequenceForTest(uri, pendingSequenceVariant)
+        }
     }
 
     private fun openVideoPicker() {
@@ -254,6 +219,85 @@ class MainActivity : Activity() {
             },
             VIDEO_PICK_REQUEST,
         )
+    }
+
+    private var pendingSequenceVariant: String = "large"
+
+    private fun openSequencePicker(variant: String) {
+        pendingSequenceVariant = variant
+        startActivityForResult(
+            Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            },
+            SEQUENCE_PICK_REQUEST,
+        )
+    }
+
+    private fun stageSequenceForTest(treeUri: Uri, variant: String) {
+        Thread {
+            try {
+                val takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                runCatching { contentResolver.takePersistableUriPermission(treeUri, takeFlags) }
+                val staged = stagePngSequence(treeUri)
+                val module = if (variant == "large") "large_online_video" else "small_online_video"
+                runOnUiThread {
+                    startTests(
+                        requested = listOf(module),
+                        sequenceDir = staged.directory.absolutePath,
+                        sequenceFrames = staged.frameCount,
+                    )
+                }
+            } catch (error: Throwable) {
+                Log.e(TAG, "could not stage video sequence", error)
+                runOnUiThread {
+                    output.text = "GVC-RT clean deployment\nFAILED: ${error.javaClass.simpleName}: ${error.message}\n"
+                }
+            }
+        }.start()
+    }
+
+    private fun stagePngSequence(treeUri: Uri): StagedSequence {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+            treeUri,
+            DocumentsContract.getTreeDocumentId(treeUri),
+        )
+        val entries = mutableListOf<Pair<String, Uri>>()
+        contentResolver.query(
+            childrenUri,
+            arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+            ),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            val documentIdColumn = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val displayNameColumn = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeTypeColumn = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            while (cursor.moveToNext()) {
+                val name = cursor.getString(displayNameColumn)
+                val mimeType = cursor.getString(mimeTypeColumn)
+                if (mimeType == "image/png" || name.endsWith(".png", ignoreCase = true)) {
+                    entries += name to DocumentsContract.buildDocumentUriUsingTree(
+                        treeUri,
+                        cursor.getString(documentIdColumn),
+                    )
+                }
+            }
+        }
+        require(entries.size >= 2) { "selected directory needs at least two PNG frames" }
+        val selected = entries.sortedBy { it.first }.take(SEQUENCE_FRAME_LIMIT)
+        val destination = cacheDir.resolve("sequence_inputs/${System.currentTimeMillis()}").apply { mkdirs() }
+        selected.forEachIndexed { index, (name, uri) ->
+            val safeName = File(name).name.ifBlank { "frame_$index.png" }
+            val target = destination.resolve("${index.toString().padStart(4, '0')}_$safeName")
+            contentResolver.openInputStream(uri)?.use { input ->
+                target.outputStream().use(input::copyTo)
+            } ?: error("cannot read selected frame: $name")
+        }
+        return StagedSequence(destination, selected.size)
     }
 
     private fun requestedModules(intent: Intent): List<String> {
@@ -287,6 +331,7 @@ class MainActivity : Activity() {
                 listOf("large_p_entropy_decode_speed")
             intent.getBooleanExtra("largePEntropyDecodeTest", false) -> listOf("large_p_entropy_decode")
             intent.getBooleanExtra("largeOnlineVideoTest", false) -> listOf("large_online_video")
+            intent.getBooleanExtra("smallOnlineVideoTest", false) -> listOf("small_online_video")
             intent.getBooleanExtra("largeOfflineVideoTest", false) -> listOf("large_offline_video")
             intent.getBooleanExtra("largeOnlineMainTest", false) -> listOf("large_online_main")
             intent.getBooleanExtra("ransCustomOpPartitionTest", false) -> listOf("rans_custom_op_partition")
@@ -357,14 +402,19 @@ class MainActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private fun startTests(requested: List<String>) {
+    private fun startTests(
+        requested: List<String>,
+        enterpriseVariant: String? = null,
+        sequenceDir: String? = null,
+        sequenceFrames: Int? = null,
+    ) {
         if (running) {
             Log.w(TAG, "ignored request while another module test is running")
             return
         }
         running = true
         moduleButtons.forEach { it.isEnabled = false }
-        videoStopButton.isEnabled = requested.contains("large_offline_video")
+        if (::variantSelector.isInitialized) variantSelector.isEnabled = false
         output.text = "GVC-RT clean deployment\n"
         imageComparison.visibility = View.GONE
         imageSummary.visibility = View.GONE
@@ -411,7 +461,9 @@ class MainActivity : Activity() {
                         }
                         moduleName == "enterprise_tflite" -> {
                             EnterpriseTfliteCompatibilityProbe(this, ::emit).run(
-                                variant = intent.getStringExtra("enterpriseTfliteVariant") ?: "all",
+                                variant = enterpriseVariant
+                                    ?: intent.getStringExtra("enterpriseTfliteVariant")
+                                    ?: "all",
                                 warmupRuns = intent.getIntExtra("enterpriseTfliteWarmup", 3),
                                 measuredRuns = intent.getIntExtra("enterpriseTfliteMeasured", 10),
                                 relaxFp32 = intent.getBooleanExtra("enterpriseTfliteRelaxFp32", false),
@@ -475,9 +527,11 @@ class MainActivity : Activity() {
                         }
                         moduleName == "large_online_video" -> {
                             largeOnlineRunner(::emit).runSequence(
-                                sequenceDir = intent.getStringExtra("sequenceDir")
+                                sequenceDir = sequenceDir
+                                    ?: intent.getStringExtra("sequenceDir")
                                     ?: error("largeOnlineVideoTest requires sequenceDir"),
-                                frameCount = intent.getIntExtra("sequenceFrames", 24),
+                                frameCount = sequenceFrames
+                                    ?: intent.getIntExtra("sequenceFrames", SEQUENCE_FRAME_LIMIT),
                                 warmupRuns = intent.getIntExtra("largeOnlineWarmup", 0),
                                 measuredRuns = intent.getIntExtra("largeOnlineMeasured", 1),
                                 dumpPEntropyBoundaries = intent.getBooleanExtra(
@@ -485,6 +539,15 @@ class MainActivity : Activity() {
                                     false,
                                 ),
                                 qp = fixedLargeQp(),
+                            )
+                        }
+                        moduleName == "small_online_video" -> {
+                            smallOnlineRunner(::emit).runSequence(
+                                sequenceDir = sequenceDir
+                                    ?: intent.getStringExtra("sequenceDir")
+                                    ?: error("smallOnlineVideoTest requires sequenceDir"),
+                                frameCount = sequenceFrames
+                                    ?: intent.getIntExtra("sequenceFrames", SEQUENCE_FRAME_LIMIT),
                             )
                         }
                         moduleName == "large_offline_video" -> {
@@ -574,7 +637,7 @@ class MainActivity : Activity() {
                 runOnUiThread {
                     running = false
                     moduleButtons.forEach { it.isEnabled = true }
-                    videoStopButton.isEnabled = false
+                    if (::variantSelector.isInitialized) variantSelector.isEnabled = true
                 }
             }
         }.start()
@@ -653,6 +716,16 @@ class MainActivity : Activity() {
                 imageSummaryLines["VideoQuality"] =
                     "Mean PSNR: ${line.valueAfter("mean_psnr_db")} dB"
             }
+            line.startsWith("large_online_main_output") -> {
+                imageSummaryLines["VideoQuality"] =
+                    "Mean PSNR: ${line.valueAfter("mean_psnr_db")} dB"
+            }
+            line.startsWith("large_online_video_summary") || line.startsWith("small_online_video_summary") -> {
+                imageSummaryLines["VideoSpeed"] =
+                    "Sequence: ${line.valueAfter("mean_frame_ms")} ms/frame, ${line.valueAfter("fps")} fps"
+                imageSummaryLines["VideoQuality"] =
+                    "Mean PSNR: ${line.valueAfter("mean_psnr_db")} dB"
+            }
         }
         if (imageSummaryLines.isNotEmpty()) {
             imageSummary.text = imageSummaryLines.values.joinToString("\n")
@@ -664,6 +737,14 @@ class MainActivity : Activity() {
         largeOnlineRunner ?: LargeOnlineCodecRunner(this, emit, ::showImageComparison, ::showVideoComparison).also {
             largeOnlineRunner = it
         }
+
+    private fun smallOnlineRunner(emit: (String) -> Unit): SmallOnlineSequenceRunner =
+        smallOnlineRunner ?: SmallOnlineSequenceRunner(this, emit, ::showVideoComparison).also {
+            smallOnlineRunner = it
+        }
+
+    private fun selectedEnterpriseVariant(): String =
+        variantSelector.selectedItem.toString().lowercase(Locale.US)
 
     private fun fixedLargeQp(): Int {
         val requested = intent.getIntExtra("largeOnlineQp", FIXED_LARGE_QP)
@@ -688,6 +769,7 @@ class MainActivity : Activity() {
         imageRunner = null
         largeOnlineRunner?.close()
         largeOnlineRunner = null
+        smallOnlineRunner = null
         super.onDestroy()
     }
 
@@ -695,6 +777,9 @@ class MainActivity : Activity() {
         const val TAG = "GVC_RT_CLEAN"
         private const val FIXED_LARGE_QP = 9
         private const val VIDEO_PICK_REQUEST = 4109
+        private const val SEQUENCE_PICK_REQUEST = 4110
+        private const val SEQUENCE_FRAME_LIMIT = 24
+        private data class StagedSequence(val directory: File, val frameCount: Int)
         private val ONNX_DEMO_MODULES = setOf(
             "temporal_reference",
             "complete_encoder",
