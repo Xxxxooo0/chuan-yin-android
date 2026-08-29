@@ -11,6 +11,7 @@ import android.provider.DocumentsContract
 import android.util.Log
 import android.view.Gravity
 import android.view.View
+import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.ImageView
@@ -33,8 +34,10 @@ class MainActivity : Activity() {
     private var running = false
     private var largeOnlineRunner: LargeOnlineCodecRunner? = null
     private var smallOnlineRunner: SmallOnlineSequenceRunner? = null
+    private var smallOfflineVideoRunner: SmallOfflineVideoRunner? = null
     private var pendingVideoUri: Uri? = null
     private lateinit var variantSelector: Spinner
+    private lateinit var videoStopButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -47,7 +50,13 @@ class MainActivity : Activity() {
         val sequenceTestButton = moduleButton("测试\n视频序列") {
             openSequencePicker(selectedEnterpriseVariant())
         }
-        moduleButtons = listOf(sequenceTestButton)
+        val smallVideoButton = moduleButton("Small video\noffline") {
+            openVideoPicker()
+        }
+        videoStopButton = moduleButton("Stop\nvideo") {
+            smallOfflineVideoRunner?.cancel()
+        }.apply { isEnabled = false }
+        moduleButtons = listOf(sequenceTestButton, smallVideoButton)
         variantSelector = Spinner(this).apply {
             adapter = ArrayAdapter(
                 this@MainActivity,
@@ -62,6 +71,13 @@ class MainActivity : Activity() {
             addView(TextView(this@MainActivity).apply { text = "模型" })
             addView(variantSelector)
             addView(sequenceTestButton, buttonLayoutParams())
+        }
+        val smallVideoControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(16, 0, 16, 0)
+            addView(smallVideoButton, buttonLayoutParams())
+            addView(videoStopButton, buttonLayoutParams())
         }
         inputImage = comparisonImageView()
         reconImage = comparisonImageView()
@@ -81,7 +97,9 @@ class MainActivity : Activity() {
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
+            fitsSystemWindows = true
             addView(sequenceControls)
+            addView(smallVideoControls)
             addView(
                 imageComparison,
                 LinearLayout.LayoutParams(
@@ -132,7 +150,7 @@ class MainActivity : Activity() {
                 val takeFlags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
                 runCatching { contentResolver.takePersistableUriPermission(uri, takeFlags) }
                 pendingVideoUri = uri
-                startTests(listOf("large_offline_video"))
+                startTests(listOf("small_offline_video"))
             }
             SEQUENCE_PICK_REQUEST -> stageSequenceForTest(uri, pendingSequenceVariant)
         }
@@ -251,6 +269,7 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("largePEntropyDecodeTest", false) -> listOf("large_p_entropy_decode")
             intent.getBooleanExtra("largeOnlineVideoTest", false) -> listOf("large_online_video")
             intent.getBooleanExtra("smallOnlineVideoTest", false) -> listOf("small_online_video")
+            intent.getBooleanExtra("smallOfflineVideoTest", false) -> listOf("small_offline_video")
             intent.getBooleanExtra("largeOfflineVideoTest", false) -> listOf("large_offline_video")
             intent.getBooleanExtra("largeOnlineMainTest", false) -> listOf("large_online_main")
             intent.getBooleanExtra("ransCustomOpPartitionTest", false) -> listOf("rans_custom_op_partition")
@@ -329,6 +348,10 @@ class MainActivity : Activity() {
         running = true
         moduleButtons.forEach { it.isEnabled = false }
         if (::variantSelector.isInitialized) variantSelector.isEnabled = false
+        videoStopButton.isEnabled = requested.contains("small_offline_video")
+        if (requested.contains("small_offline_video")) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         output.text = "GVC-RT clean deployment\n"
         imageComparison.visibility = View.GONE
         imageSummary.visibility = View.GONE
@@ -445,6 +468,23 @@ class MainActivity : Activity() {
                                     ?: intent.getIntExtra("sequenceFrames", SEQUENCE_FRAME_LIMIT),
                             )
                         }
+                        moduleName == "small_offline_video" -> {
+                            val uri = pendingVideoUri
+                                ?: intent.getStringExtra("videoUri")?.let(Uri::parse)
+                                ?: intent.getStringExtra("videoPath")?.let { Uri.fromFile(File(it)) }
+                                ?: error("smallOfflineVideoTest requires videoUri/videoPath or a picked video")
+                            val runner = SmallOfflineVideoRunner(this, ::emit, ::showImageComparison)
+                            smallOfflineVideoRunner = runner
+                            MemorySampler(this, ::emit).use { memory ->
+                                memory.begin("small_offline_video")
+                                runner.run(
+                                    inputUri = uri,
+                                    maxDurationSeconds = intent.getIntExtra("smallOfflineVideoSeconds", 60),
+                                    h264Bitrate = intent.getIntExtra("smallOfflineVideoBitrate", 8_000_000),
+                                )
+                                memory.mark("video_complete")
+                            }
+                        }
                         moduleName == "large_offline_video" -> {
                             val uri = pendingVideoUri
                                 ?: intent.getStringExtra("videoUri")?.let(Uri::parse)
@@ -506,7 +546,10 @@ class MainActivity : Activity() {
                     running = false
                     moduleButtons.forEach { it.isEnabled = true }
                     if (::variantSelector.isInitialized) variantSelector.isEnabled = true
+                    videoStopButton.isEnabled = false
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
+                smallOfflineVideoRunner = null
             }
         }.start()
     }
@@ -580,6 +623,14 @@ class MainActivity : Activity() {
                 imageSummaryLines["VideoQuality"] =
                     "Mean PSNR: ${line.valueAfter("mean_psnr_db")} dB"
             }
+            line.startsWith("small_offline_video_speed stage=model_summary") -> {
+                imageSummaryLines["Small speed"] =
+                    "Small model: ${line.valueAfter("mean_frame_ms")} ms/frame, ${line.valueAfter("fps")} FPS"
+            }
+            line.startsWith("small_offline_video_quality") -> {
+                imageSummaryLines["Small PSNR"] =
+                    "Video PSNR: ${line.valueAfter("mean_psnr_db")} dB (mean)"
+            }
         }
         if (imageSummaryLines.isNotEmpty()) {
             imageSummary.text = imageSummaryLines.values.joinToString("\n")
@@ -619,6 +670,8 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        smallOfflineVideoRunner?.close()
+        smallOfflineVideoRunner = null
         largeOnlineRunner?.close()
         largeOnlineRunner = null
         smallOnlineRunner = null
