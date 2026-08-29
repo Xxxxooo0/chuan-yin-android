@@ -3,6 +3,13 @@ package com.gvcrt.clean
 import java.io.Closeable
 import kotlin.math.ln
 
+data class CdfSpec(
+    val cdf: String,
+    val shape: LongArray,
+    val cdfLengths: String,
+    val offsets: String,
+)
+
 data class CdfTable(
     val values: IntArray,
     val rows: Int,

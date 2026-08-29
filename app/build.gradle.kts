@@ -23,13 +23,6 @@ android {
 
     flavorDimensions += "deployment"
     productFlavors {
-        create("onnxDemo") {
-            dimension = "deployment"
-            applicationIdSuffix = ".onnxdemo"
-            versionNameSuffix = "-onnx"
-            resValue("string", "app_name", "GVC-RT ONNX")
-            buildConfigField("String", "DEPLOYMENT_PATH", "\"onnx_demo\"")
-        }
         create("mtkOffline") {
             dimension = "deployment"
             applicationIdSuffix = ".mtkoffline"
@@ -51,11 +44,6 @@ android {
                 assets.srcDirs("src/main/assets")
             }
         }
-        getByName("onnxDemo") {
-            if (!project.hasProperty("gvcrtSkipAssets")) {
-                assets.srcDir(rootProject.file("models/onnx-demo/assets"))
-            }
-        }
         getByName("mtkOffline") {
             if (project.hasProperty("gvcrtSkipAssets")) {
                 assets.setSrcDirs(emptyList<String>())
@@ -66,7 +54,7 @@ android {
     }
 
     androidResources {
-        noCompress += listOf("tflite", "onnx", "mnn", "bin", "f32le", "gvc", "dla")
+        noCompress += listOf("tflite", "mnn", "bin", "f32le", "gvc", "dla")
     }
 
     externalNativeBuild {
@@ -87,7 +75,6 @@ kotlin {
 
 dependencies {
     implementation(files("../mtk/Android_V_neuropilot_240408.aar"))
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.22.0")
     implementation("org.tensorflow:tensorflow-lite:2.17.0")
     implementation("org.tensorflow:tensorflow-lite-gpu:2.17.0")
     implementation("org.tensorflow:tensorflow-lite-gpu-api:2.17.0")

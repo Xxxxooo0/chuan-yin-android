@@ -1,16 +1,6 @@
 # 部署路线
 
-## 当前路线 1：ONNX Demo
-
-- Source set：`app/src/onnxDemo/`
-- 神经网络运行时：ONNX Runtime
-- 模型：`models/onnx-demo/assets/models/*.onnx`
-- 构建：`./gradlew :app:assembleOnnxDemoDebug`
-- Application ID：`com.gvcrt.clean.onnxdemo`
-
-该路线用于图片重建、PSNR、码流回环和模块演示。rANS 使用共享原生实现。
-
-## 当前路线 2：MTK 在线部署（Large / Small）
+## 当前路线：MTK 在线部署（Large / Small）
 
 - Source set：`app/src/mtkOffline/`
 - 神经网络运行时：TFLite + MediaTek 官方 `NeuronDelegate`

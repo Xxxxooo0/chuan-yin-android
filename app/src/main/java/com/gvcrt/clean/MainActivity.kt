@@ -31,8 +31,6 @@ class MainActivity : Activity() {
     private lateinit var imageSummary: TextView
     private val imageSummaryLines = linkedMapOf<String, String>()
     private var running = false
-    private var imageRunner: ImageInferenceRunner? = null
-    private var imageRunnerBackend: OnnxBackend? = null
     private var largeOnlineRunner: LargeOnlineCodecRunner? = null
     private var smallOnlineRunner: SmallOnlineSequenceRunner? = null
     private var pendingVideoUri: Uri? = null
@@ -40,81 +38,16 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val isOnnxDemo = BuildConfig.DEPLOYMENT_PATH == "onnx_demo"
         output = TextView(this).apply {
             textSize = 13f
             setPadding(24, 24, 24, 24)
-            text = "GVC-RT clean deployment\nSelect one module test.\n"
+            text = "GVC-RT MTK online deployment\n选择 Large 或 Small 视频序列。\n"
         }
 
-        val temporalButton = moduleButton("Temporal\nreference") {
-            startTests(listOf("temporal_reference"))
-        }
-        val encoderButton = moduleButton("Complete\nencoder") {
-            startTests(listOf("complete_encoder"))
-        }
-        val decoderButton = moduleButton("Complete\ndecoder") {
-            startTests(listOf("complete_decoder"))
-        }
-        val temporalSpeedButton = moduleButton("Temporal\nspeed") {
-            startTests(listOf("temporal_reference_speed"))
-        }
-        val encoderSpeedButton = moduleButton("Encoder\nspeed") {
-            startTests(listOf("complete_encoder_speed"))
-        }
-        val decoderSpeedButton = moduleButton("Decoder\nspeed") {
-            startTests(listOf("complete_decoder_speed"))
-        }
-        val fullProjectButton = moduleButton("Full\nproject") {
-            startTests(FULL_PROJECT_MODULES)
-        }
-        val imageInferenceButton = moduleButton("Image\ninfer") {
-            startTests(listOf("image_inference"))
-        }
         val sequenceTestButton = moduleButton("测试\n视频序列") {
             openSequencePicker(selectedEnterpriseVariant())
         }
-        moduleButtons = buildList {
-            addAll(
-                listOf(
-                    temporalButton,
-                    encoderButton,
-                    decoderButton,
-                    temporalSpeedButton,
-                    encoderSpeedButton,
-                    decoderSpeedButton,
-                    fullProjectButton,
-                    imageInferenceButton,
-                )
-            )
-            if (!isOnnxDemo) {
-                add(sequenceTestButton)
-            }
-        }
-
-        val controls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(16, 16, 16, 0)
-            addView(temporalButton, buttonLayoutParams())
-            addView(encoderButton, buttonLayoutParams())
-            addView(decoderButton, buttonLayoutParams())
-        }
-        val speedControls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(16, 0, 16, 0)
-            addView(temporalSpeedButton, buttonLayoutParams())
-            addView(encoderSpeedButton, buttonLayoutParams())
-            addView(decoderSpeedButton, buttonLayoutParams())
-        }
-        val projectControls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(16, 0, 16, 0)
-            addView(fullProjectButton, buttonLayoutParams())
-            addView(imageInferenceButton, buttonLayoutParams())
-        }
+        moduleButtons = listOf(sequenceTestButton)
         variantSelector = Spinner(this).apply {
             adapter = ArrayAdapter(
                 this@MainActivity,
@@ -148,12 +81,7 @@ class MainActivity : Activity() {
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(controls)
-            addView(speedControls)
-            addView(projectControls)
-            if (!isOnnxDemo) {
-                addView(sequenceControls)
-            }
+            addView(sequenceControls)
             addView(
                 imageComparison,
                 LinearLayout.LayoutParams(
@@ -301,16 +229,7 @@ class MainActivity : Activity() {
     }
 
     private fun requestedModules(intent: Intent): List<String> {
-        val requested = when {
-            intent.getBooleanExtra("temporalReferenceTest", false) -> listOf("temporal_reference")
-            intent.getBooleanExtra("completeEncoderTest", false) -> listOf("complete_encoder")
-            intent.getBooleanExtra("completeDecoderTest", false) -> listOf("complete_decoder")
-            intent.getBooleanExtra("temporalReferenceSpeedTest", false) -> listOf("temporal_reference_speed")
-            intent.getBooleanExtra("completeEncoderSpeedTest", false) -> listOf("complete_encoder_speed")
-            intent.getBooleanExtra("completeDecoderSpeedTest", false) -> listOf("complete_decoder_speed")
-            intent.getBooleanExtra("fullProjectTest", false) -> FULL_PROJECT_MODULES
-            intent.getBooleanExtra("imageInferenceTest", false) -> listOf("image_inference")
-            intent.getBooleanExtra("sequenceInferenceTest", false) -> listOf("sequence_inference")
+        return when {
             intent.getBooleanExtra("largeIpEntropyCodecTest", false) ->
                 listOf("large_i_entropy_codec", "large_p_entropy_codec")
             intent.getBooleanExtra("largeIEntropyMergedSpeedTest", false) -> listOf("large_i_entropy_merged_speed")
@@ -337,11 +256,6 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("ransCustomOpPartitionTest", false) -> listOf("rans_custom_op_partition")
             intent.getBooleanExtra("enterpriseTfliteTest", false) -> listOf("enterprise_tflite")
             else -> emptyList()
-        }
-        return if (BuildConfig.DEPLOYMENT_PATH != "onnx_demo" || requested.all(ONNX_DEMO_MODULES::contains)) {
-            requested
-        } else {
-            emptyList()
         }
     }
 
@@ -438,27 +352,8 @@ class MainActivity : Activity() {
             try {
                 emit("deployment_path=${BuildConfig.DEPLOYMENT_PATH}")
                 emit("requested_modules=${requested.joinToString(",")}")
-                val fullProjectRun = requested == FULL_PROJECT_MODULES
                 requested.forEach { moduleName ->
                     when {
-                        moduleName == "image_inference" -> {
-                            val backend = if (intent.getBooleanExtra("imageInferenceCpu", false)) {
-                                OnnxBackend.CPU
-                            } else {
-                                OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK
-                            }
-                            imageRunnerFor(backend, ::emit).run(
-                                intent.getStringExtra("imagePath"),
-                                decodeFromBitstream = intent.getBooleanExtra("imageInferenceDecodeBitstream", true),
-                            )
-                        }
-                        moduleName == "sequence_inference" -> {
-                            imageRunnerFor(OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK, ::emit).runSequence(
-                                sequenceDir = intent.getStringExtra("sequenceDir")
-                                    ?: error("sequenceInferenceTest requires sequenceDir"),
-                                frameCount = intent.getIntExtra("sequenceFrames", 96),
-                            )
-                        }
                         moduleName == "enterprise_tflite" -> {
                             EnterpriseTfliteCompatibilityProbe(this, ::emit).run(
                                 variant = enterpriseVariant
@@ -600,34 +495,7 @@ class MainActivity : Activity() {
                                 validatePrecision = false,
                             )
                         }
-                        moduleName.endsWith("_speed") -> {
-                            val speedBackend = if (
-                                intent.getBooleanExtra("speedNnapiCpuDisabled", false)
-                            ) {
-                                OnnxBackend.NNAPI_FP16_CPU_DISABLED
-                            } else {
-                                OnnxBackend.NNAPI_FP16_ALLOW_FALLBACK
-                            }
-                            ModuleSpeedBenchmarks(
-                                this,
-                                ::emit,
-                                backend = speedBackend,
-                                warmupRuns = intent.getIntExtra("speedWarmup", 5),
-                                measuredRuns = intent.getIntExtra("speedMeasured", 50),
-                                enableProfiling = intent.getBooleanExtra("onnxProfiling", false),
-                            ).runModule(moduleName.removeSuffix("_speed"))
-                        }
-                        else -> {
-                            if (fullProjectRun) {
-                                MemorySampler(this, ::emit).use { memory ->
-                                    memory.begin("full_project_$moduleName")
-                                    CleanModuleTests(this, ::emit).runModule(moduleName)
-                                    memory.mark("${moduleName}_complete")
-                                }
-                            } else {
-                                CleanModuleTests(this, ::emit).runModule(moduleName)
-                            }
-                        }
+                        else -> error("unsupported module: $moduleName")
                     }
                 }
             } catch (t: Throwable) {
@@ -641,20 +509,6 @@ class MainActivity : Activity() {
                 }
             }
         }.start()
-    }
-
-    private fun imageRunnerFor(
-        backend: OnnxBackend,
-        emit: (String) -> Unit,
-    ): ImageInferenceRunner {
-        if (imageRunnerBackend != backend) {
-            imageRunner?.close()
-            imageRunner = null
-            imageRunnerBackend = backend
-        }
-        return imageRunner ?: ImageInferenceRunner(this, emit, backend, ::showImageComparison).also {
-            imageRunner = it
-        }
     }
 
     private fun showImageComparison(inputFile: File, reconFile: File, psnr: Double) {
@@ -765,8 +619,6 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        imageRunner?.close()
-        imageRunner = null
         largeOnlineRunner?.close()
         largeOnlineRunner = null
         smallOnlineRunner = null
@@ -780,20 +632,5 @@ class MainActivity : Activity() {
         private const val SEQUENCE_PICK_REQUEST = 4110
         private const val SEQUENCE_FRAME_LIMIT = 24
         private data class StagedSequence(val directory: File, val frameCount: Int)
-        private val ONNX_DEMO_MODULES = setOf(
-            "temporal_reference",
-            "complete_encoder",
-            "complete_decoder",
-            "temporal_reference_speed",
-            "complete_encoder_speed",
-            "complete_decoder_speed",
-            "image_inference",
-            "sequence_inference",
-        )
-        private val FULL_PROJECT_MODULES = listOf(
-            "temporal_reference",
-            "complete_encoder",
-            "complete_decoder",
-        )
     }
 }

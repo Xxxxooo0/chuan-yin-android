@@ -4,7 +4,7 @@
 
 本仓库是用于 GVC-RT 推理与诊断的精简 Android 部署项目。Android 应用位于 `app/`。
 
-- `app/src/main/java/com/gvcrt/clean/`：Kotlin 应用逻辑、ONNX/TFLite 运行器、模块测试、速度基准测试、内存采样和图像推理。
+- `app/src/main/java/com/gvcrt/clean/`：Kotlin 应用逻辑、TFLite/Neuron 运行器、模块测试、速度基准测试、内存采样和图像推理。
 - `app/src/main/cpp/`：原生 C++/JNI 代码、rANS 集成、MTK TFLite 桥接和融合算子实验。
 - `app/src/main/assets/`：打包进 APK 的运行时资源。除非明确需要，`models/` 和 `baseline/` 下的大型基线及模型资源应保持忽略状态。
 - `app/src/main/jniLibs/`：Android 运行时需要的原生动态库。

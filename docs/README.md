@@ -4,10 +4,10 @@
 
 ## 当前部署与交付
 
-- [部署路线](deployment-variants.md)：ONNX Demo、MTK 在线 Large/Small，以及后续 DLA 交付的边界。
+- [部署路线](deployment-variants.md)：MTK 在线 Large/Small 与后续 DLA 交付的边界。
 - [GVC-RT Large 在线部署](large-online-deployment.md)：固定 QP9 打包、entropy+rANS 合图、Android 测试命令、1 分钟离线视频演示。
 - [仓库目录说明](repository-layout.md)：各目录职责、模型测试工作区与本地生成物的位置。
-- [模型索引](../models/README.md)：ONNX 运行资产、Large/Small 包、校验文件及使用原则。
+- [模型索引](../models/README.md)：Large/Small 包、校验文件及使用原则。
 - [服务端导出工具](../server_tools/README.md)：远端导出、离线编译、精度向量、视频序列与结果审计命令。
 
 模型测试工作区（`model_test/`）的结构与模型晋升流程见仓库根目录 [AGENTS.md](../AGENTS.md)。

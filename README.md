@@ -1,9 +1,8 @@
 # GVC-RT Android 部署
 
-本仓库保留两条当前部署路线：
+本仓库的 Android 应用只保留 **MTK 在线部署**：使用 TFLite 与官方 `NeuronDelegate` 在设备侧在线编译，通过外置模型包选择 GVC-RT Large 或 Small。
 
-1. **ONNX Demo**：用于图片重建、码流回环、PSNR 和模块演示。
-2. **MTK 在线部署**：使用 TFLite 与官方 `NeuronDelegate` 在设备侧在线编译；通过外置模型包选择 GVC-RT Large 或 Small。
+Android ONNX Demo 已从活动项目移除，本地归档位于 `local_archive/onnx-demo-android/`；服务器端为 TFLite/DLA 转换保留的 ONNX 导出能力仍位于 `server_tools/`。
 
 后续将增加 **MTK 离线 DLA 部署**，用于企业侧离线集成；当前 Android APK 不使用 `.dla` 运行模型。
 
@@ -15,7 +14,6 @@ Large 在线 I 帧合并熵模型的独立部署、测速和精度 dump 命令�
 
 ```powershell
 cd D:\android\ceshi\GVC-RT_clean_android
-.\gradlew.bat -PgvcrtSkipAssets :app:assembleOnnxDemoDebug
 .\gradlew.bat -PgvcrtSkipAssets :app:assembleMtkOfflineDebug
 ```
 
@@ -29,15 +27,6 @@ cd D:\android\ceshi\GVC-RT_clean_android
 
 ```powershell
 $adb = '.\sdk\platform-tools\adb.exe'
-& $adb install -r .\app\build\outputs\apk\onnxDemo\debug\app-onnxDemo-debug.apk
-& $adb logcat -c
-& $adb shell am start -n com.gvcrt.clean.onnxdemo/com.gvcrt.clean.MainActivity --ez imageInferenceTest true
-& $adb logcat -d -s GVC_RT_CLEAN:I
-```
-
-MTK 在线部署需要先把解压后的模型包推送到设备（包目录与设备路径见 [models/README.md](models/README.md)），再触发测试：
-
-```powershell
 & $adb install -r .\app\build\outputs\apk\mtkOffline\debug\app-mtkOffline-debug.apk
 & $adb shell am start -n com.gvcrt.clean.mtkoffline/com.gvcrt.clean.MainActivity --ez enterpriseTfliteTest true --es enterpriseTfliteVariant large
 & $adb logcat -d -s GVC_RT_CLEAN:I

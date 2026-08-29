@@ -2,16 +2,19 @@
 
 这些脚本只在远端 Linux/PyTorch 环境运行。本机仅用于编辑、构建 APK 和通过 adb 安装测试。
 
-## ONNX Demo 导出
+## ONNX 中间图与基线导出
 
-从源码导出 ONNX demo 所需模型与基线，固定尺寸为 `256x512`、QP 为 `0`：
+该脚本不再对应 Android 运行入口，仅在服务器保留，用于从源码导出转换与验证所需的 ONNX 中间图和基线。固定尺寸为 `256x512`、QP 为 `0`：
 
 ```bash
 cd /media/ltelab/D/weilingfeng/GVC-RT_clean_android
 export GVC_RT_SOURCE_ROOT=/media/ltelab/D/weilingfeng/GVC-RT_inference
 python server_tools/export_clean_gvcrt_modules.py \
+  --output-assets outputs/onnx-intermediate \
   --height 256 --width 512 --qp 0 --precision fp32
 ```
+
+默认输出同样是 `outputs/onnx-intermediate/`；该目录由 Git 忽略，不参与 Android 构建。
 
 ## MTK Large 离线导出（企业交付备用）
 

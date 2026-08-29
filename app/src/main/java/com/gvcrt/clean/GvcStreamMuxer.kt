@@ -2,6 +2,15 @@ package com.gvcrt.clean
 
 import java.io.ByteArrayOutputStream
 
+data class StreamSpec(
+    val path: String,
+    val height: Int,
+    val width: Int,
+    val qp: Int,
+    val ecPart: Int,
+    val useAdaI: Int,
+)
+
 data class ParsedGvcStream(
     val stream: StreamSpec,
     val iPayload: ByteArray,

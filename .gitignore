@@ -20,8 +20,7 @@ app/src/main/assets/recon_mnn/
 app/src/mtkOffline/conversion_inputs/
 app/src/mtkOffline/assets/offline_models/
 
-# Local model assets and model-package worktrees
-models/onnx-demo/assets/
+# Local model-package worktrees
 models/large/
 models/small/
 

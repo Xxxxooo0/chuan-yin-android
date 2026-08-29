@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-root", default=os.environ.get("GVC_RT_SOURCE_ROOT"))
     parser.add_argument(
         "--output-assets",
-        default=str(PROJECT_ROOT / "app" / "src" / "onnxDemo" / "assets"),
+        default=str(PROJECT_ROOT / "outputs" / "onnx-intermediate"),
     )
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=512)

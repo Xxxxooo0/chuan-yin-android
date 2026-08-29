@@ -4,22 +4,9 @@
 
 ```text
 models/
-├─ onnx-demo/   ONNX Demo 的 APK 运行资产
 ├─ large/       GVC-RT Large 模型分支 worktree
 └─ small/       GVC-RT Small 模型分支 worktree
 ```
-
-## ONNX Demo
-
-- 资产目录：`models/onnx-demo/assets/`
-- 模型目录：`models/onnx-demo/assets/models/`
-- 基线目录：`models/onnx-demo/assets/baseline/`
-- 清单：`models/onnx-demo/assets/gvcrt_clean_manifest.json`
-- Android 构建：`./gradlew :app:assembleOnnxDemoDebug`
-
-Gradle 将该资产目录作为 `onnxDemo` flavor 的额外 assets source。使用 `-PgvcrtSkipAssets` 时不打包这些大模型，适合只做源码和 JNI 构建检查。
-
-当前清单中的 19 个已存在 ONNX 文件均通过 SHA256 校验。清单还记录了未随本机资产保存的可选融合图 `i_image_encoder_fused.onnx` 和 `p_image_encoder_fused.onnx`；当前 Android 路径使用已验证的分图序列，不应将这两个缺失文件视为可用部署入口。
 
 ## GVC-RT Large
 
