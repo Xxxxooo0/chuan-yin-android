@@ -29,6 +29,12 @@ merged+rANS 图与固定 QP9 包内容一致。旧在线包及旧的 7 张 I 与
 - 当前企业流程：四模型 QP9（`temporal_from_frame`、`temporal_from_feature`、`encoder`、`decoder`），打包见 `server_tools/compile_tflite_package_to_dla.py` 与 `package_enterprise_video_sequence.py`，二者要求恰好这四张模型且 `fixed_q_index=9`
 - 本地旧包：`gvc-rt-small_tflite_codec_270p_qp0_with_inputs.tar.gz`（三模型 QP0），新四模型包生成并通过 `model_test/` 验证后按晋升流程替换
 
+## 标准 TFLite GPU 包
+
+- Small GPU 六图：`gpu_models/small/gvc-rt-small_tflite_gpu_270p_qp9_six_graphs.tar.gz`，设备目录为 `enterprise_tflite/gpusmall/`。
+- Large GPU 十图：`gpu_models/large/gvc-rt-large_tflite_gpu_270p_qp9_ten_graphs.tar.gz`，设备目录为 `enterprise_tflite/gpularge/`。
+- 两套 GPU 包均与 `models/large/`、`models/small/` 的 MTK/NPU 包并存，不覆盖正式 MTK 模型。
+
 ## 使用原则
 
 1. Large/Small 是只保存模型包的专用 worktree；Android、文档和导出代码统一使用主项目版本。

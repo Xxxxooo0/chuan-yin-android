@@ -37,3 +37,28 @@ target_include_directories(gvcrt_small_gpu_rans PRIVATE ${CMAKE_CURRENT_SOURCE_D
 target_compile_features(gvcrt_small_gpu_rans PRIVATE cxx_std_17)
 target_compile_options(gvcrt_small_gpu_rans PRIVATE -O3)
 target_link_libraries(gvcrt_small_gpu_rans ${log-lib} ${dl-lib})
+
+# Large GPU fused entropy graphs reuse the existing Large rANS JNI source
+# through a narrow RegistrationExternal-to-TfLiteOperator adapter. The MTK
+# library and its JNI entry points remain unchanged.
+add_library(
+    gvcrt_large_gpu_entropy_encode
+    SHARED
+    large_gpu_entropy_encode_jni.cpp
+    rans/rans.cpp
+)
+target_include_directories(gvcrt_large_gpu_entropy_encode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rans)
+target_compile_features(gvcrt_large_gpu_entropy_encode PRIVATE cxx_std_17)
+target_compile_options(gvcrt_large_gpu_entropy_encode PRIVATE -O3)
+target_link_libraries(gvcrt_large_gpu_entropy_encode ${log-lib} ${dl-lib})
+
+add_library(
+    gvcrt_large_gpu_entropy_decode
+    SHARED
+    large_gpu_entropy_decode_jni.cpp
+    rans/rans.cpp
+)
+target_include_directories(gvcrt_large_gpu_entropy_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rans)
+target_compile_features(gvcrt_large_gpu_entropy_decode PRIVATE cxx_std_17)
+target_compile_options(gvcrt_large_gpu_entropy_decode PRIVATE -O3)
+target_link_libraries(gvcrt_large_gpu_entropy_decode ${log-lib} ${dl-lib})

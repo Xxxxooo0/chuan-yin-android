@@ -24,6 +24,7 @@ class LargeOnlineCodecRunner(
     private val emit: (String) -> Unit,
     private val showImages: ((File, File, Double) -> Unit)? = null,
     private val showVideoFrames: ((Bitmap, Bitmap, Double, Int) -> Unit)? = null,
+    val backend: RuntimeBackend = RuntimeBackend.MTK_NPU,
 ) : AutoCloseable {
     private var prepared: PreparedRuntimes? = null
     private val videoCancelled = AtomicBoolean(false)
@@ -594,6 +595,9 @@ class LargeOnlineCodecRunner(
         val totalStarted = SystemClock.elapsedRealtimeNanos()
         val payloads = ArrayList<GvcFramePayload>(inputCount)
         val encoderReconstructionHashes = ArrayList<String>(inputCount)
+        val encoderYHatHashes = ArrayList<String>(inputCount)
+        val encoderCtxTHashes = HashMap<Int, String>()
+        val pEntropyDiagnostics = HashMap<Int, List<ByteArray>>()
         val pEntropyFrameTimes = ArrayList<Long>((inputCount - 1).coerceAtLeast(0))
         val iBoundaries = linkedMapOf<String, ByteArray>()
         var encoderReferenceFrame: ByteArray? = null
@@ -621,6 +625,7 @@ class LargeOnlineCodecRunner(
                     ).single()
                 }
                 payloads += GvcFramePayload(true, entropy[1])
+                encoderYHatHashes += sha256(entropy[0])
                 encoderReconstructionHashes += sha256(reconstruction)
                 encoderReferenceFrame = reconstruction
             } else {
@@ -649,7 +654,8 @@ class LargeOnlineCodecRunner(
                     runtimes.pEncoder.run(runtimes.neuralInputs(listOf(input, ctx), "p_q_enc")).single()
                 }
                 val entropyStarted = SystemClock.elapsedRealtimeNanos()
-                val entropy = if (index in pEntropyBoundaryFrames) {
+                val inspectGpuEntropy = backend == RuntimeBackend.TFLITE_GPU && index == 1
+                val entropy = if (index in pEntropyBoundaryFrames || inspectGpuEntropy) {
                     val outputs = runtimes.pEntropyEncoder.run(y, ctxT, qp = runtimes.stream.qp)
                     require(outputs.size == 8) { "P entropy diagnostic outputs=${outputs.size}" }
                     val payloadSize = java.nio.ByteBuffer.wrap(outputs[7])
@@ -667,6 +673,7 @@ class LargeOnlineCodecRunner(
                     iBoundaries["${prefix}_s_w_1"] = outputs[4]
                     iBoundaries["${prefix}_y_hat"] = outputs[5]
                     iBoundaries["${prefix}_rans_payload"] = outputs[6].copyOf(payloadSize)
+                    if (inspectGpuEntropy) pEntropyDiagnostics[index] = outputs.take(6)
                     listOf(outputs[5], outputs[6].copyOf(payloadSize))
                 } else {
                     runtimes.pEntropyEncoder.runCanonical(y, ctxT, qp = runtimes.stream.qp)
@@ -692,6 +699,8 @@ class LargeOnlineCodecRunner(
                 }
                 require(reconstruction.size == 2) { "encoder P decoder outputs=${reconstruction.size}" }
                 payloads += GvcFramePayload(false, entropy[1])
+                encoderYHatHashes += sha256(entropy[0])
+                encoderCtxTHashes[index] = sha256(ctxT)
                 encoderReferenceFeature = reconstruction[0]
                 encoderReferenceFrame = reconstruction[1]
                 encoderReconstructionHashes += sha256(reconstruction[1])
@@ -720,6 +729,9 @@ class LargeOnlineCodecRunner(
                 require(index == 0) { "I payload must be frame zero" }
                 val yHat = timed("decode_i_entropy_rans") {
                     runtimes.iEntropyDecoder.runCanonical(framePayload.payload, qp = runtimes.stream.qp)
+                }
+                require(encoderYHatHashes[index] == sha256(yHat)) {
+                    "encoder/decoder entropy y_hat mismatch at frame=$index type=I"
                 }
                 if (collectTimings) iBoundaries["android_i_y_hat_decode"] = yHat
                 val reconstruction = timed("decode_i_decoder") {
@@ -759,12 +771,42 @@ class LargeOnlineCodecRunner(
                 require(temporal.size == 3) { "decoder temporal outputs=${temporal.size}" }
                 val ctx = temporal[1]
                 val ctxT = temporal[2]
+                val entropyDiagnostic = pEntropyDiagnostics[index]
                 val yHat = timed("decode_p_entropy_rans") {
-                    runtimes.pEntropyDecoder.runCanonical(
-                        framePayload.payload,
-                        ctxT,
-                        qp = runtimes.stream.qp,
-                    )
+                    if (entropyDiagnostic == null) {
+                        runtimes.pEntropyDecoder.runCanonical(
+                            framePayload.payload,
+                            ctxT,
+                            qp = runtimes.stream.qp,
+                        )
+                    } else {
+                        val decoded = runtimes.pEntropyDecoder.run(
+                            framePayload.payload,
+                            ctxT,
+                            qp = runtimes.stream.qp,
+                        )
+                        require(decoded.size == 6) { "P entropy diagnostic decode outputs=${decoded.size}" }
+                        val names = listOf("z_hat", "y_q_w_0", "y_q_w_1", "s_w_0", "s_w_1", "y_hat")
+                        names.indices.forEach { outputIndex ->
+                            emit(
+                                pEntropyDifference(
+                                    frame = index,
+                                    name = names[outputIndex],
+                                    encoded = entropyDiagnostic[outputIndex],
+                                    decoded = decoded[outputIndex],
+                                    compareCdfIndexes = outputIndex == 3 || outputIndex == 4,
+                                ),
+                            )
+                        }
+                        decoded[5]
+                    }
+                }
+                emit(
+                    "large_gpu_p_context_compare frame=${index + 1} " +
+                        "ctx_t_exact=${encoderCtxTHashes[index] == sha256(ctxT)}",
+                )
+                require(encoderYHatHashes[index] == sha256(yHat)) {
+                    "encoder/decoder entropy y_hat mismatch at frame=$index type=P"
                 }
                 val reconstruction = timed("decode_p_decoder") {
                     runtimes.pDecoder.run(
@@ -797,7 +839,11 @@ class LargeOnlineCodecRunner(
             it.selectQp(qp)
             return it
         }
-        val root = findPackageRoot()
+        return backend.create(emit) { selected -> prepare(qp, selected) }
+    }
+
+    private fun prepare(qp: Int, selected: RuntimeBackend): PreparedRuntimes {
+        val root = findPackageRoot(selected)
         val manifest = JSONObject(root.resolve("manifest.json").readText())
         val quantScales = LargeDynamicQuantScales.load(root, manifest)
         val packagedQp = manifest.optInt("default_qp", manifest.getInt("qp"))
@@ -823,31 +869,78 @@ class LargeOnlineCodecRunner(
             "Large online main requires ${HEIGHT}x$WIDTH"
         }
         val createStarted = SystemClock.elapsedRealtimeNanos()
-        val official = linkedMapOf<String, OfficialNeuronRuntime>()
-        var iEncode: IEntropyRansMergedRuntime? = null
-        var pEncode: PEntropyRansMergedRuntime? = null
-        var iDecode: IEntropyRansDecodeMergedRuntime? = null
-        var pDecode: PEntropyRansDecodeMergedRuntime? = null
+        val official = linkedMapOf<String, SelectedModelRuntime>()
+        var iEncode: SelectedIEntropyEncoder? = null
+        var pEncode: SelectedPEntropyEncoder? = null
+        var iDecode: SelectedIEntropyDecoder? = null
+        var pDecode: SelectedPEntropyDecoder? = null
         try {
-            REQUIRED_OFFICIAL_MODELS.forEach { name -> official[name] = createOfficial(root, name) }
-            iEncode = IEntropyRansMergedRuntime.create(
-                model(root, I_ENTROPY_ENCODER),
-                context.cacheDir.resolve("enterprise_tflite/large/main/$I_ENTROPY_ENCODER"),
-            )
-            pEncode = PEntropyRansMergedRuntime.create(
-                model(root, P_ENTROPY_ENCODER),
-                context.cacheDir.resolve("enterprise_tflite/large/main/$P_ENTROPY_ENCODER"),
-            )
-            iDecode = IEntropyRansDecodeMergedRuntime.create(
-                model(root, I_ENTROPY_DECODER),
-                context.cacheDir.resolve("enterprise_tflite/large/main/$I_ENTROPY_DECODER"),
-                true,
-            )
-            pDecode = PEntropyRansDecodeMergedRuntime.create(
-                model(root, P_ENTROPY_DECODER),
-                context.cacheDir.resolve("enterprise_tflite/large/main/$P_ENTROPY_DECODER"),
-                true,
-            )
+            REQUIRED_OFFICIAL_MODELS.forEach { name ->
+                official[name] = if (selected == RuntimeBackend.TFLITE_GPU) {
+                    SelectedModelRuntime.gpu(
+                        GenericTfliteGpuRuntime.create(
+                            model(root, "$name.tflite"),
+                            allowUnsupportedDevice = backend == RuntimeBackend.TFLITE_GPU,
+                            allowBuiltinCpuFallback = true,
+                        ),
+                    )
+                } else {
+                    SelectedModelRuntime.neuron(createOfficial(root, name))
+                }
+            }
+            if (selected == RuntimeBackend.TFLITE_GPU) {
+                iEncode = SelectedIEntropyEncoder.gpu(
+                    LargeEntropyGpuRuntime.create(
+                        model(root, I_ENTROPY_ENCODER),
+                        LargeEntropyGpuRuntime.Kind.I_ENCODE,
+                    ),
+                )
+                pEncode = SelectedPEntropyEncoder.gpu(
+                    LargeEntropyGpuRuntime.create(
+                        model(root, P_ENTROPY_ENCODER),
+                        LargeEntropyGpuRuntime.Kind.P_ENCODE,
+                    ),
+                )
+                iDecode = SelectedIEntropyDecoder.gpu(
+                    LargeEntropyGpuRuntime.create(
+                        model(root, I_ENTROPY_DECODER),
+                        LargeEntropyGpuRuntime.Kind.I_DECODE,
+                    ),
+                )
+                pDecode = SelectedPEntropyDecoder.gpu(
+                    LargeEntropyGpuRuntime.create(
+                        model(root, P_ENTROPY_DECODER),
+                        LargeEntropyGpuRuntime.Kind.P_DECODE,
+                    ),
+                )
+            } else {
+                iEncode = SelectedIEntropyEncoder.mtk(
+                    IEntropyRansMergedRuntime.create(
+                        model(root, I_ENTROPY_ENCODER),
+                        context.cacheDir.resolve("enterprise_tflite/large/main/$I_ENTROPY_ENCODER"),
+                    ),
+                )
+                pEncode = SelectedPEntropyEncoder.mtk(
+                    PEntropyRansMergedRuntime.create(
+                        model(root, P_ENTROPY_ENCODER),
+                        context.cacheDir.resolve("enterprise_tflite/large/main/$P_ENTROPY_ENCODER"),
+                    ),
+                )
+                iDecode = SelectedIEntropyDecoder.mtk(
+                    IEntropyRansDecodeMergedRuntime.create(
+                        model(root, I_ENTROPY_DECODER),
+                        context.cacheDir.resolve("enterprise_tflite/large/main/$I_ENTROPY_DECODER"),
+                        true,
+                    ),
+                )
+                pDecode = SelectedPEntropyDecoder.mtk(
+                    PEntropyRansDecodeMergedRuntime.create(
+                        model(root, P_ENTROPY_DECODER),
+                        context.cacheDir.resolve("enterprise_tflite/large/main/$P_ENTROPY_DECODER"),
+                        true,
+                    ),
+                )
+            }
             return PreparedRuntimes(
                 stream = stream,
                 temporalFromFrame = official.getValue("temporal_from_frame"),
@@ -866,13 +959,14 @@ class LargeOnlineCodecRunner(
                 prepared = it
                 emit(
                     "large_online_main_prepare models=10 create_ms=${format(elapsedMs(createStarted))} " +
-                        "backend=official_aar_neuron fast_models=10 decoder_models=scaled_variance_fp16 " +
+                        "backend=${if (selected == RuntimeBackend.TFLITE_GPU) "tflite_gpu" else "official_aar_neuron"} " +
+                        "fast_models=10 decoder_models=scaled_variance_fp16 " +
                         "dynamic_qp=${quantScales != null} qp=$qp " +
                         "preference=FAST_SINGLE_ANSWER root=${root.absolutePath}",
                 )
             }
         } catch (error: Throwable) {
-            official.values.forEach(OfficialNeuronRuntime::close)
+            official.values.forEach(SelectedModelRuntime::close)
             iEncode?.close()
             pEncode?.close()
             iDecode?.close()
@@ -900,13 +994,18 @@ class LargeOnlineCodecRunner(
         require(it.isFile) { "missing Large online model: ${it.absolutePath}" }
     }
 
-    private fun findPackageRoot(): File {
-        val internal = context.filesDir.resolve("enterprise_tflite/large")
-        val external = context.getExternalFilesDir(null)?.resolve("enterprise_tflite/large")
+    private fun findPackageRoot(selected: RuntimeBackend): File {
+        val packagePath = if (selected == RuntimeBackend.TFLITE_GPU) {
+            "enterprise_tflite/gpularge"
+        } else {
+            "enterprise_tflite/large"
+        }
+        val internal = context.filesDir.resolve(packagePath)
+        val external = context.getExternalFilesDir(null)?.resolve(packagePath)
         val required = REQUIRED_OFFICIAL_MODELS.map { "models/$it.tflite" } + REQUIRED_MERGED_MODELS.map { "models/$it" }
         return listOfNotNull(internal, external).firstOrNull { root ->
             root.resolve("manifest.json").isFile && required.all { root.resolve(it).isFile }
-        } ?: error("no complete Large online package found")
+        } ?: error("no complete Large online package found at $packagePath")
     }
 
     private fun emitSummary(results: List<RunResult>, frameCount: Int) {
@@ -947,6 +1046,38 @@ class LargeOnlineCodecRunner(
         }
         val rmse = sqrt(sumSq / (input.size / 4))
         return if (rmse == 0.0) Double.POSITIVE_INFINITY else 20.0 * log10(1.0 / rmse)
+    }
+
+    private fun pEntropyDifference(
+        frame: Int,
+        name: String,
+        encoded: ByteArray,
+        decoded: ByteArray,
+        compareCdfIndexes: Boolean,
+    ): String {
+        require(encoded.size == decoded.size && encoded.size % 4 == 0)
+        val left = java.nio.ByteBuffer.wrap(encoded).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+        val right = java.nio.ByteBuffer.wrap(decoded).order(java.nio.ByteOrder.LITTLE_ENDIAN).asFloatBuffer()
+        var maxAbs = 0.0
+        var sumSq = 0.0
+        var cdfMismatch = 0
+        repeat(left.capacity()) { index ->
+            val a = left[index]
+            val b = right[index]
+            val diff = kotlin.math.abs(a - b).toDouble()
+            maxAbs = maxOf(maxAbs, diff)
+            sumSq += diff * diff
+            if (compareCdfIndexes && entropyScaleIndex(a) != entropyScaleIndex(b)) ++cdfMismatch
+        }
+        return "large_gpu_p_entropy_compare frame=${frame + 1} tensor=$name " +
+            "exact=${encoded.contentEquals(decoded)} max_abs=${format(maxAbs)} " +
+            "rmse=${format(sqrt(sumSq / left.capacity()))}" +
+            if (compareCdfIndexes) " cdf_index_mismatch=$cdfMismatch" else ""
+    }
+
+    private fun entropyScaleIndex(value: Float): Int {
+        val scale = value.coerceIn(0.11f, 16.0f)
+        return ((kotlin.math.ln(scale) + 2.2072749f) * 25.502707f).toInt().coerceIn(0, 127)
     }
 
     private fun shouldResetReference(frameIndex: Int): Boolean =
@@ -1032,16 +1163,16 @@ class LargeOnlineCodecRunner(
 
     private data class PreparedRuntimes(
         var stream: StreamSpec,
-        val temporalFromFrame: OfficialNeuronRuntime,
-        val temporalFromFeature: OfficialNeuronRuntime,
-        val iEncoder: OfficialNeuronRuntime,
-        val pEncoder: OfficialNeuronRuntime,
-        val iDecoder: OfficialNeuronRuntime,
-        val pDecoder: OfficialNeuronRuntime,
-        val iEntropyEncoder: IEntropyRansMergedRuntime,
-        val pEntropyEncoder: PEntropyRansMergedRuntime,
-        val iEntropyDecoder: IEntropyRansDecodeMergedRuntime,
-        val pEntropyDecoder: PEntropyRansDecodeMergedRuntime,
+        val temporalFromFrame: SelectedModelRuntime,
+        val temporalFromFeature: SelectedModelRuntime,
+        val iEncoder: SelectedModelRuntime,
+        val pEncoder: SelectedModelRuntime,
+        val iDecoder: SelectedModelRuntime,
+        val pDecoder: SelectedModelRuntime,
+        val iEntropyEncoder: SelectedIEntropyEncoder,
+        val pEntropyEncoder: SelectedPEntropyEncoder,
+        val iEntropyDecoder: SelectedIEntropyDecoder,
+        val pEntropyDecoder: SelectedPEntropyDecoder,
         val quantScales: LargeDynamicQuantScales?,
         val fixedPackageQp: Int?,
     ) : AutoCloseable {

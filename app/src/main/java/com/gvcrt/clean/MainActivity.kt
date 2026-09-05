@@ -397,6 +397,7 @@ class MainActivity : Activity() {
                     require(
                         requestedBackend == RuntimeBackend.MTK_NPU || moduleName in listOf(
                             "gpu_model", "small_entropy_gpu", "small_online_video",
+                            "large_online_main", "large_online_video", "large_offline_video",
                         ),
                     ) {
                         "gpu_delegate_unsupported module=$moduleName backend=${requestedBackend.logName} reason=mtk_only_entry"
@@ -496,7 +497,7 @@ class MainActivity : Activity() {
                             )
                         }
                         moduleName == "large_online_main" -> {
-                            largeOnlineRunner(::emit).run(
+                            largeOnlineRunner(::emit, requestedBackend).run(
                                 imagePath = intent.getStringExtra("imagePath"),
                                 warmupRuns = intent.getIntExtra("largeOnlineWarmup", 1),
                                 measuredRuns = intent.getIntExtra("largeOnlineMeasured", 1),
@@ -504,7 +505,7 @@ class MainActivity : Activity() {
                             )
                         }
                         moduleName == "large_online_video" -> {
-                            largeOnlineRunner(::emit).runSequence(
+                            largeOnlineRunner(::emit, requestedBackend).runSequence(
                                 sequenceDir = sequenceDir
                                     ?: intent.getStringExtra("sequenceDir")
                                     ?: error("largeOnlineVideoTest requires sequenceDir"),
@@ -553,7 +554,7 @@ class MainActivity : Activity() {
                                 ?: error("largeOfflineVideoTest requires videoUri/videoPath or a picked video")
                             MemorySampler(this, ::emit).use { memory ->
                                 memory.begin("large_offline_video")
-                                largeOnlineRunner(::emit).runOfflineVideo(
+                                largeOnlineRunner(::emit, requestedBackend).runOfflineVideo(
                                     inputUri = uri,
                                     maxDurationSeconds = intent.getIntExtra("largeOfflineVideoSeconds", 60),
                                     h264Bitrate = intent.getIntExtra("largeOfflineVideoBitrate", 8_000_000),
@@ -700,10 +701,13 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun largeOnlineRunner(emit: (String) -> Unit): LargeOnlineCodecRunner =
-        largeOnlineRunner ?: LargeOnlineCodecRunner(this, emit, ::showImageComparison, ::showVideoComparison).also {
+    private fun largeOnlineRunner(emit: (String) -> Unit, backend: RuntimeBackend): LargeOnlineCodecRunner {
+        largeOnlineRunner?.takeIf { it.backend == backend }?.let { return it }
+        largeOnlineRunner?.close()
+        return LargeOnlineCodecRunner(this, emit, ::showImageComparison, ::showVideoComparison, backend).also {
             largeOnlineRunner = it
         }
+    }
 
     private fun smallOnlineRunner(
         emit: (String) -> Unit,

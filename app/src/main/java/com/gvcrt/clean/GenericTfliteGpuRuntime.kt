@@ -85,6 +85,7 @@ class GenericTfliteGpuRuntime private constructor(
             tfliteFile: File,
             allowUnsupportedDevice: Boolean = false,
             allowBuiltinCpuFallback: Boolean = false,
+            allowPrecisionLoss: Boolean = true,
         ): GenericTfliteGpuRuntime {
             require(tfliteFile.isFile) {
                 "gpu_model_create_failed model=${tfliteFile.absolutePath} backend=tflite_gpu reason=missing_file"
@@ -102,7 +103,11 @@ class GenericTfliteGpuRuntime private constructor(
                     }
                     val options = if (compatibilitySupported) compatibility.bestOptionsForThisDevice else GpuDelegate.Options()
                     stage = "delegate_create"
-                    GpuDelegate(options.setQuantizedModelsAllowed(false)).also {
+                    GpuDelegate(
+                        options
+                            .setPrecisionLossAllowed(allowPrecisionLoss)
+                            .setQuantizedModelsAllowed(false),
+                    ).also {
                         Log.i("GVC_RT_CLEAN", "gpu_delegate_create_ok model=${tfliteFile.name}")
                     }
                 }
@@ -169,6 +174,7 @@ class GenericTfliteGpuRuntime private constructor(
                     optionsSummary =
                         "TFLiteGpu(compatibility_list_supported=$compatibilitySupported," +
                             "gpu_forced_probe=$forcedProbe,cpu_fallback_allowed=$allowBuiltinCpuFallback," +
+                            "precision_loss_allowed=$allowPrecisionLoss," +
                             "quantized=false,xnnpack=false,nnapi=false)",
                 )
             } catch (error: Throwable) {

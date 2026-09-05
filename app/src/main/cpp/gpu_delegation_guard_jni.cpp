@@ -61,7 +61,7 @@ TfLiteStatus inspectPlan(TfLiteContext* context, TfLiteDelegate* delegate) {
             guard->failure = "node_registration_unavailable";
             break;
         }
-        if (node->delegate == guard->gpu) {
+        if (guard->gpu != nullptr && node->delegate == guard->gpu) {
             ++gpuNodes;
         } else if (isAllowedNativeRans(*guard, *node, *registration)) {
             ++allowedRansNodes;

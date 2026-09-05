@@ -14,6 +14,7 @@ build/
 *.rar
 *.tar.gz
 !gpu_models/small/*.tar.gz
+!gpu_models/large/*.tar.gz
 __pycache__/
 
 # Generated runtime assets and conversion products
