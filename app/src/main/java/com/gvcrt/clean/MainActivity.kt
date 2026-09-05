@@ -37,6 +37,7 @@ class MainActivity : Activity() {
     private var smallOfflineVideoRunner: SmallOfflineVideoRunner? = null
     private var pendingVideoUri: Uri? = null
     private lateinit var variantSelector: Spinner
+    private lateinit var backendSelector: Spinner
     private lateinit var videoStopButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,7 +45,7 @@ class MainActivity : Activity() {
         output = TextView(this).apply {
             textSize = 13f
             setPadding(24, 24, 24, 24)
-            text = "GVC-RT MTK online deployment\n选择 Large 或 Small 视频序列。\n"
+            text = "GVC-RT GPU / MTK NPU deployment\n选择模型、后端和视频序列。\n"
         }
 
         val sequenceTestButton = moduleButton("测试\n视频序列") {
@@ -64,12 +65,21 @@ class MainActivity : Activity() {
                 listOf("Large", "Small"),
             )
         }
+        backendSelector = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                RuntimeBackend.entries.map(RuntimeBackend::logName),
+            )
+            setSelection(RuntimeBackend.entries.indexOf(RuntimeBackend.MTK_NPU))
+        }
         val sequenceControls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             setPadding(16, 0, 16, 0)
             addView(TextView(this@MainActivity).apply { text = "模型" })
             addView(variantSelector)
+            addView(backendSelector)
             addView(sequenceTestButton, buttonLayoutParams())
         }
         val smallVideoControls = LinearLayout(this).apply {
@@ -168,9 +178,11 @@ class MainActivity : Activity() {
     }
 
     private var pendingSequenceVariant: String = "large"
+    private var pendingSequenceBackend: RuntimeBackend = RuntimeBackend.MTK_NPU
 
     private fun openSequencePicker(variant: String) {
         pendingSequenceVariant = variant
+        pendingSequenceBackend = RuntimeBackend.parse(backendSelector.selectedItem.toString())
         startActivityForResult(
             Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
@@ -191,6 +203,7 @@ class MainActivity : Activity() {
                         requested = listOf(module),
                         sequenceDir = staged.directory.absolutePath,
                         sequenceFrames = staged.frameCount,
+                        runtimeBackend = pendingSequenceBackend,
                     )
                 }
             } catch (error: Throwable) {
@@ -269,6 +282,8 @@ class MainActivity : Activity() {
             intent.getBooleanExtra("largePEntropyDecodeTest", false) -> listOf("large_p_entropy_decode")
             intent.getBooleanExtra("largeOnlineVideoTest", false) -> listOf("large_online_video")
             intent.getBooleanExtra("smallOnlineVideoTest", false) -> listOf("small_online_video")
+            intent.getBooleanExtra("smallEntropyGpuTest", false) -> listOf("small_entropy_gpu")
+            intent.getBooleanExtra("gpuModelTest", false) -> listOf("gpu_model")
             intent.getBooleanExtra("smallOfflineVideoTest", false) -> listOf("small_offline_video")
             intent.getBooleanExtra("largeOfflineVideoTest", false) -> listOf("large_offline_video")
             intent.getBooleanExtra("largeOnlineMainTest", false) -> listOf("large_online_main")
@@ -340,6 +355,7 @@ class MainActivity : Activity() {
         enterpriseVariant: String? = null,
         sequenceDir: String? = null,
         sequenceFrames: Int? = null,
+        runtimeBackend: RuntimeBackend? = null,
     ) {
         if (running) {
             Log.w(TAG, "ignored request while another module test is running")
@@ -348,6 +364,7 @@ class MainActivity : Activity() {
         running = true
         moduleButtons.forEach { it.isEnabled = false }
         if (::variantSelector.isInitialized) variantSelector.isEnabled = false
+        if (::backendSelector.isInitialized) backendSelector.isEnabled = false
         videoStopButton.isEnabled = requested.contains("small_offline_video")
         if (requested.contains("small_offline_video")) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -374,9 +391,52 @@ class MainActivity : Activity() {
 
             try {
                 emit("deployment_path=${BuildConfig.DEPLOYMENT_PATH}")
+                val requestedBackend = runtimeBackend ?: RuntimeBackend.parse(intent.getStringExtra("backend"))
                 emit("requested_modules=${requested.joinToString(",")}")
                 requested.forEach { moduleName ->
+                    require(
+                        requestedBackend == RuntimeBackend.MTK_NPU || moduleName in listOf(
+                            "gpu_model", "small_entropy_gpu", "small_online_video",
+                        ),
+                    ) {
+                        "gpu_delegate_unsupported module=$moduleName backend=${requestedBackend.logName} reason=mtk_only_entry"
+                    }
                     when {
+                        moduleName == "small_entropy_gpu" -> {
+                            require(requestedBackend == RuntimeBackend.TFLITE_GPU) {
+                                "smallEntropyGpuTest requires backend=GPU"
+                            }
+                            SmallEntropyGpuProbe(::emit).run(
+                                encodeModel = File(
+                                    intent.getStringExtra("smallEntropyEncodeModelPath")
+                                        ?: error("smallEntropyGpuTest requires smallEntropyEncodeModelPath"),
+                                ),
+                                decodeModel = File(
+                                    intent.getStringExtra("smallEntropyDecodeModelPath")
+                                        ?: error("smallEntropyGpuTest requires smallEntropyDecodeModelPath"),
+                                ),
+                                fixtureDir = File(
+                                    intent.getStringExtra("smallEntropyFixtureDir")
+                                        ?: error("smallEntropyGpuTest requires smallEntropyFixtureDir"),
+                                ),
+                                outputDir = File(
+                                    intent.getStringExtra("smallEntropyOutputDir")
+                                        ?: error("smallEntropyGpuTest requires smallEntropyOutputDir"),
+                                ),
+                            )
+                        }
+                        moduleName == "gpu_model" -> {
+                            TfliteGpuModelProbe(::emit).run(
+                                model = File(intent.getStringExtra("gpuModelPath") ?: error("gpuModelTest requires gpuModelPath")),
+                                inputDir = File(intent.getStringExtra("gpuInputDir") ?: error("gpuModelTest requires gpuInputDir")),
+                                outputDir = File(intent.getStringExtra("gpuOutputDir") ?: error("gpuModelTest requires gpuOutputDir")),
+                                allowUnsupportedDevice = requestedBackend != RuntimeBackend.AUTO,
+                                allowBuiltinCpuFallback = intent.getBooleanExtra(
+                                    "gpuAllowBuiltinCpuFallback",
+                                    false,
+                                ),
+                            )
+                        }
                         moduleName == "enterprise_tflite" -> {
                             EnterpriseTfliteCompatibilityProbe(this, ::emit).run(
                                 variant = enterpriseVariant
@@ -460,7 +520,8 @@ class MainActivity : Activity() {
                             )
                         }
                         moduleName == "small_online_video" -> {
-                            smallOnlineRunner(::emit).runSequence(
+                            val useEntropy = intent.getBooleanExtra("smallOnlineUseEntropy", true)
+                            smallOnlineRunner(::emit, requestedBackend, useEntropy).runSequence(
                                 sequenceDir = sequenceDir
                                     ?: intent.getStringExtra("sequenceDir")
                                     ?: error("smallOnlineVideoTest requires sequenceDir"),
@@ -546,6 +607,7 @@ class MainActivity : Activity() {
                     running = false
                     moduleButtons.forEach { it.isEnabled = true }
                     if (::variantSelector.isInitialized) variantSelector.isEnabled = true
+                    if (::backendSelector.isInitialized) backendSelector.isEnabled = true
                     videoStopButton.isEnabled = false
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 }
@@ -643,10 +705,15 @@ class MainActivity : Activity() {
             largeOnlineRunner = it
         }
 
-    private fun smallOnlineRunner(emit: (String) -> Unit): SmallOnlineSequenceRunner =
-        smallOnlineRunner ?: SmallOnlineSequenceRunner(this, emit, ::showVideoComparison).also {
-            smallOnlineRunner = it
-        }
+    private fun smallOnlineRunner(
+        emit: (String) -> Unit,
+        backend: RuntimeBackend,
+        useEntropy: Boolean = true,
+    ): SmallOnlineSequenceRunner =
+        smallOnlineRunner?.takeIf { it.backend == backend && it.useEntropy == useEntropy }
+            ?: SmallOnlineSequenceRunner(this, emit, ::showVideoComparison, backend, useEntropy).also {
+                smallOnlineRunner = it
+            }
 
     private fun selectedEnterpriseVariant(): String =
         variantSelector.selectedItem.toString().lowercase(Locale.US)

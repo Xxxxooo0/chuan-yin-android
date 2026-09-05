@@ -37,6 +37,16 @@ python server_tools/export_gvc_rt_small_enterprise_dla.py \
   --ncc-tflite /path/to/neuron_sdk/host/bin/ncc-tflite
 ```
 
+## Small temporal GPU PReLU 候选
+
+`export_small_temporal_gpu_prelu.py` 只处理已验证的 Small `temporal_from_frame.tflite`：把三个 PReLU 共用的标量 alpha 按 96/192 通道逐位重复为 GPU 专用常量，不重新导出网络，不修改其它算子或模型 I/O。脚本必须在服务器 TensorFlow 环境运行，并用 TFLite `BUILTIN_REF` 对原图和候选执行 bit-exact 验证；输出必须放入独立 `model_test/` 目录。
+
+`export_small_gpu_prelu_remaining.py` 以同样规则处理 Small 其余五图。普通图用
+`BUILTIN_REF` 做原图/候选逐位验证；两张 entropy+rANS fused 图只在内存验证视图中移除
+已知 rANS custom 节点并把其输出作为外部输入，以覆盖全部 NN 区段。写出的候选仍保留
+rANS custom op，运行时必须使用本项目 `gvcrt_small_gpu_rans` 原生桥精确注册。执行边界和真机结果见
+[Small 标准 TFLite GPU 后端](../docs/tflite-gpu-backend.md)。
+
 ## 精度向量与交付包
 
 `export_enterprise_precision_vectors.py` 为企业端 DLA 输出生成输入、参考输出和比较清单；`package_enterprise_dla_codec.py` 打包已验证模型；`package_enterprise_dla_with_inputs.py` 将模型包与输入精度包合并。脚本的 `--help` 给出必填路径。

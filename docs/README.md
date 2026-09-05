@@ -10,6 +10,7 @@
 - [模型索引](../models/README.md)：Large/Small 包、校验文件及使用原则。
 - [服务端导出工具](../server_tools/README.md)：远端导出、离线编译、精度向量、视频序列与结果审计命令。
 - [DLA 功耗验证控制要求](dla-power-validation-guide.md)：Large/Small 离线模型的使能、停止、状态确认、MDLA 证据与标准功耗测试窗口。
+- [标准 TFLite GPU 后端](tflite-gpu-backend.md)：显式 GPU 探测、delegation guard、Small fused entropy+rANS 混合执行及设备结果。
 
 模型测试工作区（`model_test/`）的结构与模型晋升流程见仓库根目录 [AGENTS.md](../AGENTS.md)。
 

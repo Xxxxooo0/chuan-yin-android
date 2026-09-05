@@ -14,12 +14,20 @@ import java.util.Locale
 import kotlin.math.log10
 import kotlin.math.roundToInt
 
-/** Runs the current four-model Small QP9 package over a continuous PNG sequence. */
+/** Runs the Small QP9 package over a continuous PNG sequence. */
 class SmallOnlineSequenceRunner(
     private val context: Context,
     private val emit: (String) -> Unit,
     private val showFrame: (Bitmap, Bitmap, Double, Int) -> Unit,
+    val backend: RuntimeBackend = RuntimeBackend.MTK_NPU,
+    val useEntropy: Boolean = true,
 ) {
+    init {
+        require(useEntropy || backend == RuntimeBackend.TFLITE_GPU) {
+            "Small entropy bypass is an explicit GPU diagnostic only"
+        }
+    }
+
     fun runSequence(sequenceDir: String, frameCount: Int) {
         require(frameCount >= 2) { "Small video sequence requires at least two frames" }
         val frameFiles = File(sequenceDir).listFiles()
@@ -36,12 +44,14 @@ class SmallOnlineSequenceRunner(
         try {
             emit(
                 "small_online_video_start source=$sequenceDir frames=$frameCount fixed_q_index=9 " +
-                    "layout=NHWC io=FP32 model_input_range=0_1 reference_reset_interval=64",
+                    "layout=NHWC io=FP32 model_input_range=0_1 reference_reset_interval=64 " +
+                    "entropy_enabled=$useEntropy",
             )
             var referenceFrame = initialReferenceFrame()
             var referenceFeature: ByteArray? = null
             val frameTimes = mutableListOf<Double>()
             val psnrs = mutableListOf<Double>()
+            val graphTimes = runtimes.modelNames.associateWith { mutableListOf<Long>() }
 
             frameFiles.forEachIndexed { index, frameFile ->
                 val frame = loadFrame(frameFile)
@@ -53,11 +63,42 @@ class SmallOnlineSequenceRunner(
                     runtimes.temporalFromFeature.run(listOf(referenceFeature!!))
                 }
                 require(temporal.size == 3) { "Small temporal output count=${temporal.size}" }
+                val temporalFinished = SystemClock.elapsedRealtimeNanos()
                 val encoded = runtimes.encoder.run(listOf(frame.tensor, temporal[0]))
                 require(encoded.size == 1) { "Small encoder output count=${encoded.size}" }
-                val decoded = runtimes.decoder.run(listOf(encoded[0], temporal[0], temporal[2]))
+                val encoderFinished = SystemClock.elapsedRealtimeNanos()
+                var decoderInput = encoded[0]
+                var decoderStarted = encoderFinished
+                var payloadSize: Int? = null
+                if (runtimes.entropyEncode != null && runtimes.entropyDecode != null) {
+                    val entropyEncoded = runtimes.entropyEncode.run(listOf(encoded[0], temporal[1]))
+                    require(entropyEncoded.size == 8) {
+                        "Small entropy encode output count=${entropyEncoded.size}"
+                    }
+                    val entropyEncodeFinished = SystemClock.elapsedRealtimeNanos()
+                    payloadSize = ByteBuffer.wrap(entropyEncoded[7]).order(ByteOrder.LITTLE_ENDIAN).int
+                    require(payloadSize in 1..entropyEncoded[6].size) {
+                        "Small entropy payload size=$payloadSize capacity=${entropyEncoded[6].size}"
+                    }
+                    val entropyDecoded = runtimes.entropyDecode.run(
+                        listOf(entropyEncoded[6], entropyEncoded[7], temporal[1]),
+                    )
+                    require(entropyDecoded.size == 6) {
+                        "Small entropy decode output count=${entropyDecoded.size}"
+                    }
+                    decoderInput = entropyDecoded[5]
+                    decoderStarted = SystemClock.elapsedRealtimeNanos()
+                    graphTimes.getValue("entropy_encode_fused") += entropyEncodeFinished - encoderFinished
+                    graphTimes.getValue("entropy_decode_fused") += decoderStarted - entropyEncodeFinished
+                }
+                val decoded = runtimes.decoder.run(listOf(decoderInput, temporal[0], temporal[2]))
                 require(decoded.size == 2) { "Small decoder output count=${decoded.size}" }
-                val elapsedMs = (SystemClock.elapsedRealtimeNanos() - started) / 1_000_000.0
+                val decoderFinished = SystemClock.elapsedRealtimeNanos()
+                val elapsedMs = (decoderFinished - started) / 1_000_000.0
+                graphTimes.getValue(if (resetReference) "temporal_from_frame" else "temporal_from_feature") +=
+                    temporalFinished - started
+                graphTimes.getValue("encoder") += encoderFinished - temporalFinished
+                graphTimes.getValue("decoder") += decoderFinished - decoderStarted
 
                 referenceFeature = decoded[0]
                 referenceFrame = decoded[1]
@@ -67,7 +108,8 @@ class SmallOnlineSequenceRunner(
                 emit(
                     "small_online_video_progress frame=${index + 1}/$frameCount " +
                         "temporal=${if (resetReference) "from_frame" else "from_feature"} " +
-                        "total_ms=${format(elapsedMs)} psnr_db=${format(psnr)}",
+                        "total_ms=${format(elapsedMs)} psnr_db=${format(psnr)}" +
+                        if (payloadSize != null) " payload_bytes=$payloadSize" else "",
                 )
                 showFrame(frame.bitmap, reconstructionBitmap(referenceFrame), psnr, index + 1)
             }
@@ -76,6 +118,16 @@ class SmallOnlineSequenceRunner(
                     "fps=${format(1000.0 / frameTimes.average())} mean_psnr_db=${format(psnrs.average())} " +
                     "min_psnr_db=${format(psnrs.minOrNull()!!)}",
             )
+            graphTimes.filterValues { it.isNotEmpty() }.forEach { (model, times) ->
+                val sorted = times.sorted()
+                emit(
+                    "small_online_video_speed model=$model samples=${times.size} " +
+                        "mean_ms=${format(times.average() / 1_000_000.0)} " +
+                        "p50_ms=${format(sorted[((sorted.size - 1) * 0.50).toInt()] / 1_000_000.0)} " +
+                        "p90_ms=${format(sorted[((sorted.size - 1) * 0.90).toInt()] / 1_000_000.0)} " +
+                        "includes_create=false warmup=0 includes_first_invoke=true timing_scope=runtime_run_with_io_copy",
+                )
+            }
             emit("small_online_video_complete status=PASS all_models_exercised=true")
         } finally {
             runtimes.close()
@@ -83,12 +135,17 @@ class SmallOnlineSequenceRunner(
     }
 
     private fun findPackageRoot(): File {
-        val internal = context.filesDir.resolve("enterprise_tflite/small")
-        val external = context.getExternalFilesDir(null)?.resolve("enterprise_tflite/small")
-        val required = REQUIRED_MODELS.map { "models/$it.tflite" }
+        val packagePath = if (backend == RuntimeBackend.TFLITE_GPU) {
+            "enterprise_tflite/gpusmall"
+        } else {
+            "enterprise_tflite/small"
+        }
+        val internal = context.filesDir.resolve(packagePath)
+        val external = context.getExternalFilesDir(null)?.resolve(packagePath)
+        val required = expectedModels().map { "models/$it.tflite" }
         return listOfNotNull(internal, external).firstOrNull { root ->
             root.resolve("manifest.json").isFile && required.all { root.resolve(it).isFile }
-        } ?: error("no complete Small QP9 package found")
+        } ?: error("no complete Small QP9 package found at $packagePath")
     }
 
     private fun createRuntimes(packageRoot: File): Runtimes {
@@ -105,43 +162,119 @@ class SmallOnlineSequenceRunner(
         val declaredModels = (0 until manifest.getJSONArray("models").length()).map { index ->
             manifest.getJSONArray("models").getJSONObject(index).getString("name")
         }.toSet()
-        require(declaredModels == REQUIRED_MODELS.toSet()) {
-            "Small online sequence model set=$declaredModels expected=$REQUIRED_MODELS"
+        val expectedModels = expectedModels()
+        require(declaredModels == expectedModels.toSet()) {
+            "Small online sequence model set=$declaredModels expected=$expectedModels"
         }
-        val created = linkedMapOf<String, OfficialNeuronRuntime>()
+        return backend.create(emit) { selected -> createRuntimes(packageRoot, selected) }
+    }
+
+    private fun createRuntimes(packageRoot: File, selected: RuntimeBackend): Runtimes {
+        val created = linkedMapOf<String, SelectedModelRuntime>()
+        var entropyEncode: SelectedSmallEntropyRuntime? = null
+        var entropyDecode: SelectedSmallEntropyRuntime? = null
         val started = SystemClock.elapsedRealtimeNanos()
         try {
             REQUIRED_MODELS.forEach { name ->
                 val model = packageRoot.resolve("models/$name.tflite")
                 val sha = sha256(model)
-                val runtime = OfficialNeuronRuntime.create(
-                    tfliteFile = model,
-                    cacheDir = context.cacheDir.resolve("enterprise_tflite/small/sequence/$name"),
-                    allowFp16ForFp32 = false,
-                    executionPreference = NeuronDelegate.Options.EXECUTION_PREFERENCE_SUSTAINED_SPEED,
-                    modelToken = "gvcrt_small_qp9_${name}_${sha.take(12)}",
-                )
+                val runtime = if (selected == RuntimeBackend.TFLITE_GPU) {
+                    SelectedModelRuntime.gpu(GenericTfliteGpuRuntime.create(model, allowUnsupportedDevice = backend == RuntimeBackend.TFLITE_GPU))
+                } else {
+                    val neuron = OfficialNeuronRuntime.create(
+                        tfliteFile = model,
+                        cacheDir = context.cacheDir.resolve("enterprise_tflite/small/gvc_rt_small_relax_fp32/$name"),
+                        allowFp16ForFp32 = true,
+                        acceleratorName = "mtk-neuron",
+                        compileOptions = "--relax-fp32",
+                        executionPreference = NeuronDelegate.Options.EXECUTION_PREFERENCE_FAST_SINGLE_ANSWER,
+                        modelToken = "gvcrt_small_${name}_${sha.take(12)}",
+                    )
+                    SelectedModelRuntime.neuron(neuron)
+                }
                 emit(
                     "small_online_video_create model=$name sha256=$sha inputs=${runtime.inputSizes.joinToString(",")} " +
                         "outputs=${runtime.outputSizes.joinToString(",")} options=${runtime.optionsSummary}",
                 )
                 created[name] = runtime
             }
-            emit(
-                "small_online_video_prepare models=${created.size} create_ms=${format(elapsedMs(started))} " +
-                    "backend=official_aar_neuron allow_fp16=false root=${packageRoot.absolutePath}",
+            if (useEntropy) {
+                val encodeModel = packageRoot.resolve("models/entropy_encode_fused.tflite")
+                entropyEncode = if (selected == RuntimeBackend.TFLITE_GPU) {
+                    SelectedSmallEntropyRuntime.gpu(
+                        SmallEntropyGpuRuntime.create(encodeModel, SmallEntropyGpuRuntime.Kind.ENCODE),
+                    )
+                } else {
+                    SelectedSmallEntropyRuntime.mtk(
+                        SmallEntropyMtkRuntime.create(
+                            model = encodeModel,
+                            kind = SmallEntropyGpuRuntime.Kind.ENCODE,
+                            cacheDir = context.cacheDir.resolve(
+                                "enterprise_tflite/small/gvc_rt_small_relax_fp32/entropy_encode_fused",
+                            ),
+                        ),
+                    )
+                }
+                emit(
+                    "small_online_video_create model=entropy_encode_fused sha256=${sha256(encodeModel)} " +
+                        "inputs=${entropyEncode.inputSizes.joinToString(",")} " +
+                        "outputs=${entropyEncode.outputSizes.joinToString(",")} " +
+                        "options=${entropyEncode.optionsSummary}",
+                )
+                val decodeModel = packageRoot.resolve("models/entropy_decode_fused.tflite")
+                entropyDecode = if (selected == RuntimeBackend.TFLITE_GPU) {
+                    SelectedSmallEntropyRuntime.gpu(
+                        SmallEntropyGpuRuntime.create(decodeModel, SmallEntropyGpuRuntime.Kind.DECODE),
+                    )
+                } else {
+                    SelectedSmallEntropyRuntime.mtk(
+                        SmallEntropyMtkRuntime.create(
+                            model = decodeModel,
+                            kind = SmallEntropyGpuRuntime.Kind.DECODE,
+                            cacheDir = context.cacheDir.resolve(
+                                "enterprise_tflite/small/gvc_rt_small_relax_fp32/entropy_decode_fused",
+                            ),
+                        ),
+                    )
+                }
+                emit(
+                    "small_online_video_create model=entropy_decode_fused sha256=${sha256(decodeModel)} " +
+                        "inputs=${entropyDecode.inputSizes.joinToString(",")} " +
+                        "outputs=${entropyDecode.outputSizes.joinToString(",")} " +
+                        "options=${entropyDecode.optionsSummary}",
+                )
+            }
+            val runtimeCount = created.size + listOfNotNull(entropyEncode, entropyDecode).size
+            if (selected == RuntimeBackend.TFLITE_GPU) emit(
+                "small_online_video_prepare models=$runtimeCount " +
+                    "create_ms=${format(elapsedMs(started))} backend=tflite_gpu " +
+                    "entropy_enabled=$useEntropy " +
+                    "builtin_cpu_fallback_allowed_for_fused_entropy=$useEntropy native_rans=$useEntropy " +
+                    "root=${packageRoot.absolutePath}",
+            ) else emit(
+                "small_online_video_prepare models=$runtimeCount create_ms=${format(elapsedMs(started))} " +
+                    "backend=official_aar_neuron allow_fp16=true preference=FAST_SINGLE_ANSWER " +
+                    "accelerator=mtk-neuron compile_options=--relax-fp32 entropy_enabled=true native_rans=true " +
+                    "root=${packageRoot.absolutePath}",
             )
             return Runtimes(
                 temporalFromFrame = created.getValue("temporal_from_frame"),
                 temporalFromFeature = created.getValue("temporal_from_feature"),
                 encoder = created.getValue("encoder"),
                 decoder = created.getValue("decoder"),
+                entropyEncode = entropyEncode,
+                entropyDecode = entropyDecode,
             )
         } catch (error: Throwable) {
-            created.values.forEach(OfficialNeuronRuntime::close)
+            entropyDecode?.close()
+            entropyEncode?.close()
+            created.values.forEach(SelectedModelRuntime::close)
             throw error
         }
     }
+
+    private fun expectedModels(): List<String> =
+        ALL_MODELS
 
     private fun initialReferenceFrame(): ByteArray =
         ByteBuffer.allocate(FRAME_BYTES).order(ByteOrder.LITTLE_ENDIAN).apply {
@@ -212,13 +345,20 @@ class SmallOnlineSequenceRunner(
     private data class Frame(val bitmap: Bitmap, val tensor: ByteArray)
 
     private data class Runtimes(
-        val temporalFromFrame: OfficialNeuronRuntime,
-        val temporalFromFeature: OfficialNeuronRuntime,
-        val encoder: OfficialNeuronRuntime,
-        val decoder: OfficialNeuronRuntime,
+        val temporalFromFrame: SelectedModelRuntime,
+        val temporalFromFeature: SelectedModelRuntime,
+        val encoder: SelectedModelRuntime,
+        val decoder: SelectedModelRuntime,
+        val entropyEncode: SelectedSmallEntropyRuntime?,
+        val entropyDecode: SelectedSmallEntropyRuntime?,
     ) : AutoCloseable {
+        val modelNames: List<String> =
+            REQUIRED_MODELS + if (entropyEncode != null) ALL_MODELS.drop(REQUIRED_MODELS.size) else emptyList()
+
         override fun close() {
             decoder.close()
+            entropyDecode?.close()
+            entropyEncode?.close()
             encoder.close()
             temporalFromFeature.close()
             temporalFromFrame.close()
@@ -237,6 +377,10 @@ class SmallOnlineSequenceRunner(
             "temporal_from_feature",
             "encoder",
             "decoder",
+        )
+        private val ALL_MODELS = REQUIRED_MODELS + listOf(
+            "entropy_encode_fused",
+            "entropy_decode_fused",
         )
     }
 }

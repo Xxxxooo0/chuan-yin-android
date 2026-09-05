@@ -1,6 +1,6 @@
 # GVC-RT Android 部署
 
-本仓库的 Android 应用只保留 **MTK 在线部署**：使用 TFLite 与官方 `NeuronDelegate` 在设备侧在线编译，通过外置模型包选择 GVC-RT Large 或 Small。
+本仓库的 Android 应用默认使用 **MTK 在线部署**：使用 TFLite 与官方 `NeuronDelegate` 在设备侧在线编译，通过外置模型包选择 GVC-RT Large 或 Small。另有标准 TFLite GPU 后端：显式 GPU 可强制探测兼容名单外设备；Small 从独立 `gpusmall` 六图包执行普通 NN GPU 图与融合 entropy+rANS 路径，融合图中 GPU 不支持的 builtin 可由普通 TFLite CPU kernel 执行，rANS 使用现有 native CPU 实现。Large 合图仍未接入标准运行时 rANS。选择方式、支持边界和真机验证见 [GPU 后端说明](docs/tflite-gpu-backend.md)。
 
 Android ONNX Demo 已从活动项目移除，本地归档位于 `local_archive/onnx-demo-android/`；服务器端为 TFLite/DLA 转换保留的 ONNX 导出能力仍位于 `server_tools/`。
 
