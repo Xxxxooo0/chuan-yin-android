@@ -57,6 +57,9 @@ GPU 六图包位于 `models/small` 的 `GVC-RT-S-models` 分支：
 gvc-rt-small_tflite_gpu_270p_qp9_six_graphs.tar.gz
 ```
 
+`codex/gpu-version` 代码分支同时在 `gpu_models/small/` 保留同一包及其
+`SHA256SUMS.txt`，用于单独检出该分支时直接部署 GPU 演示。
+
 归档顶层目录为 `gpusmall/`，部署到：
 
 ```text
